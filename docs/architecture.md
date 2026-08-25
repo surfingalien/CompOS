@@ -3,15 +3,23 @@
 ## What's real in this repo today
 
 ```
-apps/api        Fastify — /healthz + /v1/brain/* (org-scoping is a
-                 placeholder header read; real API-key auth is not built)
+apps/api        Fastify — /healthz, /v1/brain/* (REST), /v1/brain/stream
+                 (SSE) (org-scoping is a placeholder header read; real
+                 API-key/session auth is not built)
 packages/brain   The Brain: event bus, event lake, correlation, health
-                 model, anomaly detectors, reflexes, diagnostician agent
-packages/db      Prisma client + RLS-transaction helper, seed schema
-packages/core    KMS credential-decryption interface (not wired to a
-                 real provider yet)
+                 model, anomaly detectors, reflexes, diagnostician agent,
+                 live SSE fan-out (live.ts, cross-process via Redis Pub/Sub)
+packages/agents  runAgent(): the shared LLM-call runtime (prompt
+                 resolution, JSON parse + repair retry, GenerationJob
+                 cost/latency logging). One agent registered: ops_diagnostician
+packages/db      Prisma client + RLS-transaction helper; schema covers
+                 Organization/ApiKey, Integration (KMS-sealed connector
+                 credentials), PromptTemplate/GenerationJob (agent runtime)
+packages/core    Real AWS KMS envelope encryption (storeCredentials /
+                 decryptCredentials) — see packages/core/src/kms.ts
 packages/skills  Skill registry interface (no skills registered yet —
-                 connectors would register here)
+                 connectors would register here and call
+                 getOrgCredentials(), which now actually decrypts)
 packages/ethics-crypto  computeShredDate() — crypto-shred timing logic
                  for the (not-yet-built) isolated ethics service
 ```
@@ -111,3 +119,12 @@ outage degrades the Brain's visibility, not the flow being observed.
 - `deploy.sh` ran `psql` inside the Node/api container, which has no
   `psql` client installed — schema setup now runs against the `postgres`
   service container instead.
+
+A second design doc ("final wiring") assumed ~150 files from prior rounds
+— the full schema, `packages/questionnaire`, `packages/review`, `apps/web`,
+`apps/workers`, the Check DSL, a User/session domain — already existed in
+this repo. They don't; only what's in this file and the manifest above is
+real. `docs/merge-ledger.md` #13–19 covers what was built for real from
+that round (KMS, the Brain's SSE stream, `packages/agents`) versus what
+was skipped and why (instrumented check runner, Temporal worker
+bootstrap, session auth, screen-backend handlers).

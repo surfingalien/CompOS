@@ -14,24 +14,31 @@ observability and safe automated response.
 
 - ✅ **`packages/brain`** — event bus (Redis Streams) → append-only event
   lake (Postgres) → flow correlation → health scoring → anomaly detection
-  → guarded reflexes → RAG diagnostician agent → `/v1/brain/*` API.
-- ✅ **`apps/api`** — Fastify app mounting the Brain's REST surface.
+  → guarded reflexes → RAG diagnostician agent → `/v1/brain/*` REST API →
+  `GET /v1/brain/stream` live SSE feed (cross-process via Redis Pub/Sub).
+- ✅ **`packages/agents`** — `runAgent()`, the shared LLM-call runtime
+  (versioned prompts, JSON parse + one repair retry, cost/latency logging
+  to `GenerationJob`). One agent registered: `ops_diagnostician`.
+- ✅ **`packages/core`** — real AWS KMS envelope encryption
+  (`storeCredentials`/`decryptCredentials`) for connector credentials.
+- ✅ **`apps/api`** — Fastify app mounting the Brain's REST + SSE surface.
 - ✅ **`packages/ethics-crypto`** — crypto-shred date computation for the
   (future) isolated ethics hotline, with tests.
-- 🔶 **`packages/db`**, **`packages/core`**, **`packages/skills`** —
-  minimal seed packages (Prisma client + RLS helper, a KMS credential
-  interface, a skill registry) that the modules above depend on but that
-  need real backing implementations (a full compliance data model, an
-  actual KMS integration, registered connector skills) before they do
-  anything beyond compile.
+- 🔶 **`packages/db`**, **`packages/skills`** — `packages/db`'s schema now
+  covers `Organization`/`ApiKey`/`Integration`/`PromptTemplate`/
+  `GenerationJob` (real, generated, migrated) but not yet the control/
+  evidence/policy/questionnaire data model; `packages/skills`' registry
+  interface has no skills registered yet — connectors would register here
+  and call `getOrgCredentials()`, which now actually decrypts.
 - 📋 Everything else in `docs/architecture.md`'s target picture —
   `apps/web`, `apps/workers` (Temporal), the isolated `apps/ethics`
   stack, the control-framework/evidence/policy/questionnaire data model,
-  connectors, the MCP tool catalog — is design, not code, in this repo.
+  connectors, the MCP tool catalog, session auth — is design, not code,
+  in this repo.
 
-See `docs/merge-ledger.md` for the specific bugs found and fixed while
-turning the original design draft into this code, and what was
-deliberately left as an honest stub instead.
+See `docs/merge-ledger.md` for the specific bugs found and fixed across
+both build rounds, and what was deliberately left as an honest stub or
+skipped outright instead of faking it.
 
 ## Quickstart (dev)
 
@@ -65,13 +72,14 @@ recommended at that tier — see `infra/k8s/README.md`).
 | Var | Required | Purpose |
 |---|---|---|
 | `DATABASE_URL` | ✅ | Postgres (pgvector) |
-| `REDIS_URL` | ✅ | Brain event bus |
-| `ANTHROPIC_API_KEY` | for `/v1/brain/ask` | Diagnostician agent |
+| `REDIS_URL` | ✅ | Brain event bus + SSE live-stream fan-out |
+| `ANTHROPIC_API_KEY` | for `/v1/brain/ask` | `runAgent()` / diagnostician |
+| `AWS_KMS_MAIN_KEY_ID` | for connectors | KMS envelope encryption (`packages/core/src/kms.ts`) |
 | `PAGERDUTY_WEBHOOK` | optional | Brain CRITICAL-anomaly paging |
 | `API_HTTP_PORT` / `BRAIN_HTTP_PORT` | optional | default 3000 / 3010 |
 
-`.env.example` also lists vars for the not-yet-built ethics stack and
-connectors — harmless to leave blank until those modules exist.
+`.env.example` also lists vars for the not-yet-built ethics stack —
+harmless to leave blank until that module exists.
 
 ## The Brain (ops)
 
@@ -94,12 +102,17 @@ append-only event lake, then:
   touches compliance data — nothing in `reflexes.ts` imports a
   compliance-data model.
 - **Diagnoses** — `POST /v1/brain/ask` runs a retrieval-augmented root
-  cause analysis over the event lake via Claude, citing event IDs.
+  cause analysis over the event lake via `runAgent()` (`packages/agents`),
+  citing event IDs.
+- **Streams live** — `GET /v1/brain/stream` (SSE) pushes each event as
+  it's durably ingested. The worker and `apps/api` are separate
+  processes, so this rides Redis Pub/Sub (`packages/brain/src/live.ts`),
+  not an in-memory registry — see the merge ledger for why that distinction matters.
 
 Endpoints: `GET /v1/brain/health`, `/health/history`, `/anomalies`,
-`/incidents`, `/flows/:flowId`, `POST /ask`; the Brain's own process also
-serves `GET /healthz` and `GET /status.json` for an external uptime
-monitor to watch (its own deadman switch).
+`/incidents`, `/flows/:flowId`, `/stream` (SSE), `POST /ask`; the Brain's
+own process also serves `GET /healthz` and `GET /status.json` for an
+external uptime monitor to watch (its own deadman switch).
 
 ## Security model (read before customer use)
 
@@ -118,6 +131,12 @@ monitor to watch (its own deadman switch).
 4. **No AI-generated legal/compliance content ships without human
    review** — this applies the moment the control-framework/policy
    modules are built; there's no such content in this repo yet to review.
+5. **Connector credentials are KMS-sealed, not just encrypted-at-rest by
+   the database** — `packages/core/src/kms.ts` does envelope encryption
+   per credential (AWS KMS `GenerateDataKey`/`Decrypt` + AES-256-GCM);
+   `AWS_KMS_MAIN_KEY_ID` must point at a real key before any connector
+   is connected, or `storeCredentials`/`decryptCredentials` throw rather
+   than silently store plaintext.
 
 ## Testing
 

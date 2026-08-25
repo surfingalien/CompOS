@@ -1,5 +1,6 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { runAgent } from "@compos/agents";
 import { brainDb } from "../db.js";
+import { emit } from "../emit.js";
 import type { BrainEvent } from "../generated/index.js";
 
 export interface DiagnosisResult {
@@ -21,24 +22,6 @@ export interface DiagnoseInput {
   flowId?: string;
   timeRangeHours?: number;
 }
-
-const SYSTEM_PROMPT = `You are the operations diagnostician for a compliance platform. You investigate
-platform health questions using ONLY the event-lake context provided in the user message.
-
-RULES:
-1. Every claim cites event IDs or flow IDs actually present in the supplied context.
-2. Form a ranked root-cause hypothesis list. State what evidence would DISCONFIRM each —
-   a diagnosis that can't be wrong is worthless.
-3. Recommend runbook actions. NEVER recommend modifying compliance data (controls,
-   evidence, policies, framework content) — only operational remediation.
-4. If the supplied context is insufficient, say so in data_gaps. "Unknown" is a valid answer.
-
-Respond with ONLY a JSON object of this exact shape, no prose outside it:
-{ "answer": "<=5 sentences, plain English",
-  "root_causes": [{ "hypothesis": string, "confidence": 0-1,
-                    "supporting_events": ["id"...], "disconfirming_check": string }],
-  "recommended_actions": [string],
-  "data_gaps": [string] }`;
 
 export async function gatherContext(input: DiagnoseInput) {
   const since = new Date(Date.now() - (input.timeRangeHours ?? 24) * 3_600_000);
@@ -73,44 +56,24 @@ function summarizeEvent(e: BrainEvent) {
   };
 }
 
-function extractJson(text: string): string {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end === -1) throw new Error("no JSON object found in model output");
-  return text.slice(start, end + 1);
-}
-
-function parseDiagnosis(text: string, eventCount: number): DiagnosisResult {
-  try {
-    const parsed = JSON.parse(extractJson(text));
-    return {
-      answer: typeof parsed.answer === "string" ? parsed.answer : "",
-      root_causes: Array.isArray(parsed.root_causes) ? parsed.root_causes : [],
-      recommended_actions: Array.isArray(parsed.recommended_actions)
-        ? parsed.recommended_actions
-        : [],
-      data_gaps: Array.isArray(parsed.data_gaps) ? parsed.data_gaps : [],
-    };
-  } catch {
-    return {
-      answer: text.slice(0, 2000),
-      root_causes: [],
-      recommended_actions: [],
-      data_gaps: [
-        `Model response was not valid JSON; ${eventCount} events were available as context.`,
-      ],
-    };
-  }
+/** Guards the shape of whatever JSON the model produced — runAgent() guarantees valid JSON, not this shape. */
+function normalizeDiagnosis(raw: unknown): DiagnosisResult {
+  const parsed = (raw ?? {}) as Partial<DiagnosisResult>;
+  return {
+    answer: typeof parsed.answer === "string" ? parsed.answer : "",
+    root_causes: Array.isArray(parsed.root_causes) ? parsed.root_causes : [],
+    recommended_actions: Array.isArray(parsed.recommended_actions) ? parsed.recommended_actions : [],
+    data_gaps: Array.isArray(parsed.data_gaps) ? parsed.data_gaps : [],
+  };
 }
 
 /**
- * Retrieval-augmented root-cause diagnosis over the event lake.
- *
- * This is a single-shot RAG call, not an agentic tool loop — the design
- * draft this was built from assumed a `defineTool`/`runAgent` framework
- * (packages/mcp) that doesn't exist in this repo yet. When that framework
- * lands, wrap this function as its `ask_brain` tool handler rather than
- * reimplementing retrieval there.
+ * Retrieval-augmented root-cause diagnosis over the event lake, via the
+ * shared @compos/agents runtime (LLM call, JSON parse + repair retry,
+ * GenerationJob cost/latency logging). This module owns retrieval
+ * (gatherContext) and DiagnosisResult shape-guarding; the runtime owns the
+ * model call itself — see packages/agents/src/runtime.ts for why the
+ * dependency runs brain -> agents and not the other way around.
  */
 export async function diagnose(input: DiagnoseInput): Promise<DiagnosisResult> {
   const { events, anomalies, flow } = await gatherContext(input);
@@ -126,28 +89,28 @@ export async function diagnose(input: DiagnoseInput): Promise<DiagnosisResult> {
     };
   }
 
-  const client = new Anthropic();
-  const context = JSON.stringify(
-    { events: events.map(summarizeEvent), anomalies, flow },
-    null,
-    2,
-  );
-
-  const msg = await client.messages.create({
-    model: "claude-sonnet-5",
-    max_tokens: 1500,
-    system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: "user",
-        content:
-          `Question: ${input.question}\n\n` +
-          `Event-lake context (${events.length} events, ${anomalies.length} open anomalies):\n` +
-          context,
-      },
-    ],
+  const raw = await runAgent("ops_diagnostician", {
+    question: input.question,
+    events: events.map(summarizeEvent),
+    anomalies,
+    flow,
+  }, {
+    orgId: input.orgId,
+    onTelemetry: (info) => {
+      emit({
+        type: info.status === "SUCCEEDED" ? "llm.generation.completed" : "llm.generation.failed",
+        source: "agent",
+        orgId: input.orgId,
+        severityOverride: info.status === "FAILED" ? "ERROR" : undefined,
+        payload: {
+          agent: "ops_diagnostician",
+          costUsd: info.costUsd,
+          latencyMs: info.latencyMs,
+          ...(info.error ? { error: info.error } : {}),
+        },
+      });
+    },
   });
 
-  const text = msg.content.find((b) => b.type === "text")?.text ?? "{}";
-  return parseDiagnosis(text, events.length);
+  return normalizeDiagnosis(raw);
 }

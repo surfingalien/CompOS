@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.27.3",
+    "@compos/agents": "workspace:*",
     "@opentelemetry/api": "^1.9.0",
     "@prisma/client": "^5.18.0",
     "fastify": "^4.28.1",

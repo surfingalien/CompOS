@@ -43,3 +43,72 @@ model ApiKey {
   @@index([organizationId])
   @@map("api_keys")
 }
+
+// Illustrative set — extend as real connector skills land in packages/skills.
+enum IntegrationType {
+  OKTA
+  AWS
+  GITHUB
+  HRIS
+  OTHER
+}
+
+// Sealed (KMS envelope-encrypted) third-party credentials for one org's
+// connector instance. See packages/core/src/kms.ts for seal/unseal.
+model Integration {
+  id                    String          @id @default(cuid())
+  orgId                 String
+  type                  IntegrationType
+  config                Json            @default("{}")
+  // JSON-encoded Sealed{iv,ct,tag,dekCt} — never plaintext credentials.
+  encryptedCredentials  Json
+  status                String          @default("CONNECTED") // CONNECTED | ERROR | DISCONNECTED
+  syncError             String?
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
+
+  @@index([orgId, type])
+  @@map("integrations")
+}
+
+// Versioned system prompts. An ACTIVE row overrides an agent's code
+// default without a deploy; see packages/agents/src/runtime.ts.
+model PromptTemplate {
+  id           String   @id @default(cuid())
+  key          String
+  version      Int      @default(1)
+  name         String
+  systemPrompt String
+  userTemplate String   @default("{{input}}")
+  modelConfig  Json     @default("{}")
+  status       String   @default("ACTIVE") // ACTIVE | ARCHIVED
+  createdAt    DateTime @default(now())
+
+  @@unique([key, version])
+  @@index([key, status])
+  @@map("prompt_templates")
+}
+
+// Every runAgent() call, for cost/latency/failure visibility — independent
+// of any particular AI feature's domain schema.
+model GenerationJob {
+  id               String    @id @default(cuid())
+  orgId            String?
+  promptKey        String
+  promptVersion    Int
+  model            String
+  inputContext     Json
+  output           Json?
+  status           String    @default("RUNNING") // RUNNING | SUCCEEDED | FAILED
+  error            String?
+  promptTokens     Int?
+  completionTokens Int?
+  costUsd          Float?
+  latencyMs        Int?
+  createdAt        DateTime  @default(now())
+  completedAt      DateTime?
+
+  @@index([promptKey, createdAt])
+  @@index([orgId, createdAt])
+  @@map("generation_jobs")
+}

@@ -1,14 +1,23 @@
 import Fastify from "fastify";
 import { brainDb } from "./db.js";
-import { consume, ack, type RawEvent } from "./bus.js";
+import { consume, ack, bus, type RawEvent } from "./bus.js";
 import { correlateEvent, reapStuckFlows } from "./correlate.js";
 import { computeAndStoreHealth } from "./health.js";
 import { runDetectors } from "./anomaly.js";
 import { processAnomalies } from "./reflexes.js";
 import { fanOutWebhooks } from "./webhooks.js";
 import { publicStatus } from "./queries.js";
+import { publishLive } from "./live.js";
 
 const CONSUMER = `brain-${process.pid}`;
+
+function safeJsonParse(text: string): unknown {
+  try {
+    return JSON.parse(text || "{}");
+  } catch {
+    return {};
+  }
+}
 
 // The original draft referenced `ingestState.lastAt`/`.lag` from /healthz
 // without ever defining it — fixed here as real, mutated state so the
@@ -38,6 +47,19 @@ async function ingestLoop() {
     for (const e of batch) {
       await correlateEvent(e).catch((err) => console.error("brain: correlate failed", err));
       await fanOutWebhooks(e).catch((err) => console.error("brain: webhook fan-out failed", err));
+      publishLive(
+        {
+          id: e.id,
+          type: e.fields.type,
+          source: e.fields.source,
+          severity: e.fields.severity,
+          orgId: e.fields.orgId || "",
+          flowId: e.fields.flowId || "",
+          at: e.fields.at,
+          payload: safeJsonParse(e.fields.payload),
+        },
+        bus,
+      );
     }
 
     await ack(batch.map((e: RawEvent) => e.streamId));
