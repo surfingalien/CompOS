@@ -1,0 +1,125 @@
+// The Brain's own schema, isolated in the "brain" Postgres schema so it
+// never collides with (or blocks migrations of) the main application
+// schema it is observing.
+//
+// NOTE on a bug in the original design draft: `schemas = ["brain"]` on
+// the datasource requires the `multiSchema` preview feature, and every
+// model (and enum) must then carry an explicit `@@schema("brain")` —
+// omitting either makes `prisma generate` fail outright. Both are fixed
+// below.
+
+generator client {
+  provider        = "prisma-client-js"
+  output          = "../src/generated"
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["brain"]
+}
+
+enum EventSeverity {
+  INFO
+  WARN
+  ERROR
+  CRITICAL
+
+  @@schema("brain")
+}
+
+model BrainEvent {
+  id        String        @id
+  at        DateTime      @default(now())
+  type      String // "control.test.failed" — catalog.ts is the source of truth
+  source    String // api|mcp|workers|check-runner|connector|agent|review|ethics|sla|brain
+  orgId     String? // null = platform-level
+  severity  EventSeverity @default(INFO)
+  traceId   String?
+  flowId    String?
+  payload   Json          @default("{}")
+
+  @@index([at])
+  @@index([type, at])
+  @@index([flowId, at])
+  @@index([source, at])
+  @@index([orgId, at])
+  @@schema("brain")
+}
+
+model FlowRun {
+  id          String    @id
+  flowType    String // CHECK_RUN | EVIDENCE_SYNC | SLA_TIMER | POLICY_GEN | QUESTIONNAIRE | DSAR | REG_SCAN | WEBHOOK_DELIVERY
+  flowId      String    @unique
+  traceId     String?
+  orgId       String?
+  status      String    @default("RUNNING") // RUNNING|SUCCEEDED|FAILED|TIMEOUT|STUCK
+  startedAt   DateTime  @default(now())
+  endedAt     DateTime?
+  durationMs  Int?
+  eventCount  Int       @default(0)
+  lastEventAt DateTime?
+
+  @@schema("brain")
+}
+
+model HealthSnapshot {
+  id            String   @id @default(cuid())
+  at            DateTime @default(now())
+  composite     Float
+  subsystems    Json // { api: 0.99, connectors: 0.87, ... }
+  openAnomalies Int
+
+  @@index([at])
+  @@schema("brain")
+}
+
+model Anomaly {
+  id         String   @id @default(cuid())
+  at         DateTime @default(now())
+  detector   String // zscore|rate|cost|freshness|silence
+  subsystem  String
+  metric     String
+  value      Float
+  baseline   Float
+  zScore     Float?
+  severity   String // WARN|CRITICAL
+  status     String   @default("OPEN") // OPEN|ACKNOWLEDGED|RESOLVED|FALSE_POSITIVE
+  details    Json?
+  incidentId String?
+
+  @@index([status, at])
+  @@index([subsystem, at])
+  @@schema("brain")
+}
+
+model BrainIncident {
+  // OPS incident — distinct from an org-facing compliance Incident
+  id            String    @id @default(cuid())
+  title         String
+  anomalyIds    String[]  @default([])
+  status        String    @default("OPEN") // OPEN|ACKNOWLEDGED|MITIGATING|RESOLVED
+  diagnosis     String? // diagnostician output (root cause + citations)
+  runbookRef    String?
+  reflexesTaken Json? // [{action, at, result}]
+  startedAt     DateTime  @default(now())
+  resolvedAt    DateTime?
+
+  @@index([status, startedAt])
+  @@schema("brain")
+}
+
+model ReflexLog {
+  // every automated action, immutably
+  id      String   @id @default(cuid())
+  rule    String
+  trigger String // anomalyId | eventId
+  action  String
+  result  String // EXECUTED|SKIPPED|FAILED
+  detail  Json?
+  at      DateTime @default(now())
+
+  @@index([at])
+  @@schema("brain")
+}
