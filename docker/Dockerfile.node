@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage build for any Node/TypeScript workspace in this pnpm
+# monorepo. Pass the workspace path as SERVICE, e.g.:
+#   docker build -f docker/Dockerfile.node --build-arg SERVICE=packages/brain .
+#   docker build -f docker/Dockerfile.node --build-arg SERVICE=apps/api .
+#
+# NOTE: no pnpm-lock.yaml is committed yet (dependencies have never been
+# installed against a real registry in this environment). Once you run
+# `pnpm install` locally and commit the lockfile, switch the install step
+# below to `pnpm install --frozen-lockfile` for reproducible builds.
+
+FROM node:20-slim AS base
+RUN corepack enable
+WORKDIR /app
+
+FROM base AS deps
+COPY package.json pnpm-workspace.yaml ./
+COPY apps ./apps
+COPY packages ./packages
+RUN pnpm install
+
+FROM deps AS build
+ARG SERVICE
+RUN test -n "$SERVICE" || (echo "SERVICE build-arg is required" && exit 1)
+RUN pnpm --filter "./${SERVICE}" run --if-present db:generate
+RUN pnpm --filter "./${SERVICE}..." run --if-present build
+
+FROM base AS runtime
+ARG SERVICE
+ENV NODE_ENV=production
+COPY --from=build /app /app
+WORKDIR /app/${SERVICE}
+EXPOSE 3000 3010
+CMD ["pnpm", "start"]

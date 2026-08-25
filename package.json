@@ -1,0 +1,25 @@
+{
+  "name": "compos",
+  "private": true,
+  "version": "0.1.0",
+  "description": "CompOS — compliance platform core, with the Brain as its platform nervous system",
+  "packageManager": "pnpm@9.7.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "dev": "pnpm --parallel -r --if-present dev",
+    "lint": "pnpm -r --if-present lint",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "pnpm -r --if-present test",
+    "db:generate": "pnpm --filter @compos/db --filter @compos/brain run db:generate"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4"
+  }
+}

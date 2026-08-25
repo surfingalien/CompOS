@@ -1,0 +1,114 @@
+// Seed schema for the main application database.
+//
+// This is intentionally minimal: the full control-framework / evidence /
+// policy / questionnaire / vendor / incident schema referenced throughout
+// the platform design (frameworks, controls, evidence, tasks, policies,
+// vendors, incidents, questionnaires, DSAR requests, API keys, webhooks…)
+// is a large, separate modeling effort that hasn't been built in this
+// repo yet. What's here is just enough for packages/db/src/client.ts and
+// the RLS pattern it wires up to generate and be exercised end-to-end.
+//
+// Extend this file as each domain module lands; every org-scoped table
+// added here MUST get FORCE ROW LEVEL SECURITY (see rls.sql) or the
+// multi-tenant isolation this platform depends on breaks silently.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  apiKeys   ApiKey[]
+
+  @@map("organizations")
+}
+
+model ApiKey {
+  id             String       @id @default(cuid())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  hashedKey      String       @unique
+  scopes         String[]     @default([])
+  createdAt      DateTime     @default(now())
+  revokedAt      DateTime?
+
+  @@index([organizationId])
+  @@map("api_keys")
+}
+
+// Illustrative set — extend as real connector skills land in packages/skills.
+enum IntegrationType {
+  OKTA
+  AWS
+  GITHUB
+  HRIS
+  OTHER
+}
+
+// Sealed (KMS envelope-encrypted) third-party credentials for one org's
+// connector instance. See packages/core/src/kms.ts for seal/unseal.
+model Integration {
+  id                    String          @id @default(cuid())
+  orgId                 String
+  type                  IntegrationType
+  config                Json            @default("{}")
+  // JSON-encoded Sealed{iv,ct,tag,dekCt} — never plaintext credentials.
+  encryptedCredentials  Json
+  status                String          @default("CONNECTED") // CONNECTED | ERROR | DISCONNECTED
+  syncError             String?
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
+
+  @@index([orgId, type])
+  @@map("integrations")
+}
+
+// Versioned system prompts. An ACTIVE row overrides an agent's code
+// default without a deploy; see packages/agents/src/runtime.ts.
+model PromptTemplate {
+  id           String   @id @default(cuid())
+  key          String
+  version      Int      @default(1)
+  name         String
+  systemPrompt String
+  userTemplate String   @default("{{input}}")
+  modelConfig  Json     @default("{}")
+  status       String   @default("ACTIVE") // ACTIVE | ARCHIVED
+  createdAt    DateTime @default(now())
+
+  @@unique([key, version])
+  @@index([key, status])
+  @@map("prompt_templates")
+}
+
+// Every runAgent() call, for cost/latency/failure visibility — independent
+// of any particular AI feature's domain schema.
+model GenerationJob {
+  id               String    @id @default(cuid())
+  orgId            String?
+  promptKey        String
+  promptVersion    Int
+  model            String
+  inputContext     Json
+  output           Json?
+  status           String    @default("RUNNING") // RUNNING | SUCCEEDED | FAILED
+  error            String?
+  promptTokens     Int?
+  completionTokens Int?
+  costUsd          Float?
+  latencyMs        Int?
+  createdAt        DateTime  @default(now())
+  completedAt      DateTime?
+
+  @@index([promptKey, createdAt])
+  @@index([orgId, createdAt])
+  @@map("generation_jobs")
+}

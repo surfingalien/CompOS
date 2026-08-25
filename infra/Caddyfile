@@ -1,0 +1,14 @@
+# Automatic TLS via Let's Encrypt. Point DNS for each hostname at this
+# host before deploying, or Caddy will fail to obtain certificates.
+#
+# api.example.com and status.example.com are placeholders — replace with
+# your real domains before use.
+
+api.example.com {
+	reverse_proxy api:3000
+}
+
+status.example.com {
+	# /healthz + /status.json — the Brain's deadman + public status page
+	reverse_proxy brain:3010
+}
