@@ -1,0 +1,8 @@
+RIA learning signals (RegLearningSignal / RetrievalConfig)
+   └─▶ riaDriftDetector() [MONITOR — Brain periodic loop]
+        └─▶ Anomaly (detector: ria-drift)
+             └─▶ CRITICAL? ─▶ BrainIncident + diagnosis + page  [REFLEX]
+                          └─▶ ReviewItem (RIA_DRIFT) enqueued   [REFLEX]
+                               └─▶ Review Console adjudicates   [REVIEW]
+                                    ├─ Approve → recalibrate thresholds, resolve anomaly
+                                    └─ Reject  → mark FALSE_POSITIVE (detector won't re-fire)

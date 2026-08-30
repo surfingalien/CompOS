@@ -1,0 +1,534 @@
+### FILE: apps/web/src/app/controls/page.tsx
+```tsx
+"use client";
+import Link from "next/link";
+import { useApi } from "../../lib/useApi";
+import { Badge, Card, CardTitle, Skeleton } from "../../components/ui";
+import { FrameworkSigils } from "../../components/FrameworkSigils";
+interface ControlRow {
+id: string; slug: string; name: string; description: string;
+implementationStatus: "NOT_STARTED" | "IN_PROGRESS" | "IMPLEMENTED" | "MONITORING";
+}
+const TONE = { IMPLEMENTED: "pass", MONITORING: "pass", IN_PROGRESS: "info", NOT_STARTED: "zinc" } as const;
+export default function ControlsListPage() {
+const { data, loading, error } = useApi<ControlRow[]>("/v1/controls");
+if (loading) return <Skeleton className="h-96" />;
+if (error) return <Card className="p-8 text-center text-muted-foreground">Failed to load controls.</Card>;
+const rows = data ?? [];
+return (
+<div className="mx-auto max-w-4xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Controls</h1>
+<span className="text-xs text-muted-foreground">{rows.length} unified controls</span>
+</div>
+<Card>
+<CardTitle>Control library</CardTitle>
+<div className="divide-y divide-border">
+{rows.length === 0 && (
+<p className="p-8 text-center text-xs text-muted-foreground">
+No controls yet. <Link href="/onboarding" className="text-info hover:underline">Run onboarding</Link> to instantiate templates.
+</p>
+)}
+{rows.map((c) => (
+<Link key={c.id} href={`/controls/${c.slug}`} className="flex items-center gap-3 px-4 py-3 hover:bg-muted/40">
+<div className="min-w-0 flex-1">
+<p className="truncate text-[13px] font-medium">{c.name}</p>
+<p className="truncate text-xs text-muted-foreground">{c.description}</p>
+</div>
+<Badge tone={TONE[c.implementationStatus]}>{c.implementationStatus}</Badge>
+</Link>
+))}
+</div>
+</Card>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/incidents/page.tsx
+```tsx
+import { IncidentsClient } from "../../components/IncidentsClient";
+export default function Page() { return <IncidentsClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/IncidentsClient.tsx
+```tsx
+"use client";
+import { useEffect, useState } from "react";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { Badge, Button, Card, CardTitle, Skeleton } from "./ui";
+import { CountdownClock } from "./CountdownClock";
+interface IncidentRow {
+id: string; title: string; severity: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+status: string; detectedAt: string;
+_count?: { notifications: number };
+}
+interface Obligation {
+authority: string; deadlineAt: string; statute: string;
+notes?: string; basis?: string; verified?: boolean;
+}
+const SEV_TONE = { CRITICAL: "fail", HIGH: "fail", MEDIUM: "warn", LOW: "zinc" } as const;
+const IR_STATES = ["OPEN", "TRIAGE", "CONTAINED", "ERADICATED", "RECOVERED", "POSTMORTEM", "CLOSED"];
+export function IncidentsClient() {
+const { data, loading } = useApi<IncidentRow[]>("/v1/incidents");
+const [selected, setSelected] = useState<string | null>(null);
+const [obligations, setObligations] = useState<Obligation[] | null>(null);
+const [computing, setComputing] = useState(false);
+const [flash, setFlash] = useState<string | null>(null);
+useEffect(() => { if (!selected && data?.length) setSelected(data[0].id); }, [data, selected]);
+useEffect(() => {
+if (!selected) return;
+setObligations(null);
+api.post<{ obligations: Obligation[] }>(`/v1/incidents/${selected}/obligations`)
+.then((r) => setObligations(r.obligations ?? []))
+.catch(() => setObligations([]));
+}, [selected]);
+const current = data?.find((i) => i.id === selected);
+const stateIdx = current ? IR_STATES.indexOf(current.status) : -1;
+const recompute = async () => {
+if (!selected) return;
+setComputing(true);
+try {
+const r = await api.post<{ obligations: Obligation[]; clocksStarted: number }>(
+`/v1/incidents/${selected}/obligations`);
+setObligations(r.obligations ?? []);
+setFlash(`Recomputed ${r.obligations?.length ?? 0} obligations · ${r.clocksStarted} SLA clocks started`);
+setTimeout(() => setFlash(null), 4000);
+} finally { setComputing(false); }
+};
+if (loading) return <Skeleton className="h-96" />;
+if (!data?.length) return (
+<Card className="mx-auto max-w-lg p-10 text-center text-muted-foreground">No incidents. Clean record.</Card>
+);
+return (
+<div className="mx-auto max-w-4xl space-y-4">
+<h1 className="text-lg font-semibold">Incidents</h1>
+{flash && <div className="rounded-md border border-info/30 bg-info/5 px-3 py-2 text-xs text-info">{flash}</div>}
+<div className="grid gap-4 md:grid-cols-[280px_1fr]">
+<Card>
+<CardTitle>Open & recent</CardTitle>
+<div className="divide-y divide-border">
+{data.map((i) => (
+<button key={i.id} onClick={() => setSelected(i.id)}
+className={`flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs ${selected === i.id ? "bg-muted font-medium" : "hover:bg-muted/40"}`}>
+<span className="min-w-0 flex-1 truncate">{i.title}</span>
+<Badge tone={SEV_TONE[i.severity]}>{i.severity}</Badge>
+</button>
+))}
+</div>
+</Card>
+<div className="space-y-4">
+{current && (
+<Card>
+<CardTitle right={<Badge tone="info">{current.status}</Badge>}>{current.title}</CardTitle>
+<div className="space-y-3 p-4">
+<div className="flex flex-wrap items-center gap-1.5">
+{IR_STATES.map((s, i) => (
+<span key={s}>
+<span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${i <= stateIdx ? "bg-info/10 text-info" : "bg-muted text-muted-foreground"}`}>{s}</span>
+{i < IR_STATES.length - 1 && <span className="mx-0.5 text-muted-foreground">→</span>}
+</span>
+))}
+</div>
+<p className="text-xs text-muted-foreground">Detected {new Date(current.detectedAt).toLocaleString()}</p>
+</div>
+</Card>
+)}
+<Card>
+<CardTitle right={<Button variant="outline" onClick={recompute} disabled={computing}>{computing ? "Computing…" : "Recompute clocks"}</Button>}>
+Notification obligations
+</CardTitle>
+<div className="divide-y divide-border">
+{obligations === null && <p className="p-6 text-center text-xs text-muted-foreground">Computing jurisdictional deadlines…</p>}
+{obligations?.length === 0 && <p className="p-6 text-center text-xs text-muted-foreground">No obligations for the recorded facts. Set affected systems / data categories to compute clocks.</p>}
+{obligations?.map((o, i) => (
+<div key={i} className="flex items-center gap-3 px-4 py-3">
+<div className="min-w-0 flex-1">
+<p className="text-[13px] font-medium">{o.authority}</p>
+<p className="truncate text-xs text-muted-foreground">{o.statute}{o.notes ? ` · ${o.notes}` : ""}</p>
+</div>
+{o.verified === false && <Badge tone="draft">provisional</Badge>}
+<CountdownClock deadline={o.deadlineAt} />
+</div>
+))}
+</div>
+</Card>
+</div>
+</div>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/brain/page.tsx
+```tsx
+import { BrainClient } from "../../components/BrainClient";
+export default function Page() { return <BrainClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/BrainClient.tsx
+```tsx
+"use client";
+import { useState } from "react";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { useBrainStream } from "../lib/useBrainStream";
+import { time } from "../lib/format";
+import { Badge, Button, Card, CardTitle, Skeleton } from "./ui";
+interface Health { composite: number; subsystems: Record<string, number>; openAnomalies: number; at?: string }
+interface Anomaly {
+id: string; detector: string; subsystem: string; metric: string;
+value: number; baseline: number; zScore: number | null;
+severity: "WARN" | "CRITICAL"; status: string; at: string;
+}
+export function BrainClient() {
+const health = useApi<Health>("/v1/brain/health");
+const anomalies = useApi<Anomaly[]>("/v1/brain/anomalies");
+const { events, connected } = useBrainStream(40);
+const [q, setQ] = useState("");
+const [asking, setAsking] = useState(false);
+const [answer, setAnswer] = useState<string | null>(null);
+const ask = async () => {
+if (!q.trim() || asking) return;
+setAsking(true); setAnswer(null);
+try {
+const r = await api.post<{ answer: string }>("/v1/brain/ask", { question: q });
+setAnswer(r.answer);
+} catch (e) { setAnswer(`Error: ${(e as Error).message}`); }
+finally { setAsking(false); }
+};
+const composite = health.data?.composite ?? 0;
+const compositeTone = composite >= 0.9 ? "pass" : composite >= 0.7 ? "warn" : "fail";
+return (
+<div className="mx-auto max-w-5xl space-y-4">
+<div className="flex items-center justify-between">
+<h1 className="text-lg font-semibold">The Brain</h1>
+<span className={`flex items-center gap-1.5 text-xs ${connected ? "text-pass" : "text-muted-foreground"}`}>
+<span className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-pass animate-pulse" : "bg-zinc-400"}`} />
+{connected ? "observing live" : "offline"}
+</span>
+</div>
+<div className="grid gap-4 lg:grid-cols-[1fr_340px]">
+<div className="space-y-4">
+<Card>
+<CardTitle right={health.data && <Badge tone={compositeTone}>{Math.round(composite * 100)}%</Badge>}>
+Subsystem health
+</CardTitle>
+<div className="p-4">
+{health.loading ? <Skeleton /> : (
+<div className="space-y-2">
+{Object.entries(health.data?.subsystems ?? {}).map(([k, v]) => (
+<div key={k} className="flex items-center gap-2 text-xs">
+<span className="w-28 text-muted-foreground">{k.replace(/_/g, " ")}</span>
+<div className="h-2 flex-1 rounded bg-muted">
+<div className={`h-2 rounded ${v >= 0.9 ? "bg-pass" : v >= 0.6 ? "bg-warn" : "bg-fail"}`} style={{ width: `${v * 100}%` }} />
+</div>
+<span className="w-10 text-right text-muted-foreground tabular-nums">{Math.round(v * 100)}%</span>
+</div>
+))}
+{Object.keys(health.data?.subsystems ?? {}).length === 0 && (
+<p className="text-xs text-muted-foreground">No health snapshots yet — the Brain computes one every 5 minutes.</p>
+)}
+</div>
+)}
+</div>
+</Card>
+<Card>
+<CardTitle right={anomalies.data && <Badge tone={anomalies.data.length ? "warn" : "pass"}>{anomalies.data.length}</Badge>}>
+Open anomalies
+</CardTitle>
+<div className="divide-y divide-border">
+{anomalies.data?.length === 0 && <p className="p-6 text-center text-xs text-muted-foreground">No open anomalies.</p>}
+{anomalies.data?.map((a) => (
+<div key={a.id} className="px-4 py-3">
+<div className="flex items-center gap-2">
+<Badge tone={a.severity === "CRITICAL" ? "fail" : "warn"}>{a.severity}</Badge>
+<span className="text-[13px] font-medium">{a.subsystem}</span>
+<span className="text-xs text-muted-foreground">{a.detector} · {a.metric}</span>
+<span className="ml-auto text-xs text-muted-foreground">{time(a.at)}</span>
+</div>
+<p className="mt-1 text-xs text-muted-foreground">value {a.value} vs baseline {a.baseline}{a.zScore ? ` (z=${a.zScore})` : ""}</p>
+</div>
+))}
+</div>
+</Card>
+</div>
+<div className="space-y-4">
+<Card>
+<CardTitle>ask_brain <span className="ml-1 text-[10px] normal-case">ops:brain</span></CardTitle>
+<div className="space-y-2 p-4">
+<textarea value={q} onChange={(e) => setQ(e.target.value)} rows={2}
+placeholder="why did connector syncs fail overnight?"
+className="w-full rounded-md border border-border p-2 text-xs focus:border-zinc-400 focus:outline-none" />
+<Button onClick={ask} disabled={asking || !q.trim()}>{asking ? "Investigating…" : "Ask"}</Button>
+{answer && <p className="whitespace-pre-wrap rounded border border-border bg-muted/40 p-2 text-xs leading-relaxed">{answer}</p>}
+</div>
+</Card>
+<Card className="flex max-h-[360px] flex-col">
+<CardTitle>Live event feed</CardTitle>
+<div className="flex-1 divide-y divide-border overflow-y-auto">
+{events.length === 0 && <p className="p-4 text-xs text-muted-foreground">Waiting for events…</p>}
+{events.map((e) => (
+<div key={e.id} className="flex items-center gap-2 px-3 py-1.5 text-xs">
+<span className="text-muted-foreground tabular-nums">{time(e.at)}</span>
+<span className={`min-w-0 flex-1 truncate ${e.severity === "ERROR" || e.severity === "CRITICAL" ? "text-fail" : e.severity === "WARN" ? "text-warn" : "text-muted-foreground"}`}>{e.type}</span>
+</div>
+))}
+</div>
+</Card>
+</div>
+</div>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/vendors/page.tsx
+```tsx
+"use client";
+import Link from "next/link";
+import { useApi } from "../../lib/useApi";
+import { Badge, Card, CardTitle, Skeleton } from "../../components/ui";
+interface VendorRow {
+id: string; name: string; criticality: string; dataAccess: string; status: string;
+website?: string | null;
+}
+const CRIT_TONE = { CRITICAL: "fail", HIGH: "warn", MEDIUM: "info", LOW: "zinc" } as const;
+export default function VendorsPage() {
+const { data, loading } = useApi<VendorRow[]>("/v1/vendors");
+if (loading) return <Skeleton className="h-96" />;
+const rows = data ?? [];
+return (
+<div className="mx-auto max-w-4xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Vendors</h1>
+<span className="text-xs text-muted-foreground">{rows.length} tracked</span>
+</div>
+<Card>
+<CardTitle>Vendor register</CardTitle>
+<div className="divide-y divide-border">
+{rows.length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No vendors yet. Add one via <code className="rounded bg-muted px-1">create_vendor</code> (module: Vendor Risk).</p>}
+{rows.map((v) => (
+<div key={v.id} className="flex items-center gap-3 px-4 py-3">
+<div className="min-w-0 flex-1">
+<p className="text-[13px] font-medium">{v.name}</p>
+<p className="text-xs text-muted-foreground">data access: {v.dataAccess}</p>
+</div>
+<Badge tone={CRIT_TONE[v.criticality as keyof typeof CRIT_TONE] ?? "zinc"}>{v.criticality}</Badge>
+<Badge tone={v.status === "APPROVED" ? "pass" : v.status === "REJECTED" ? "fail" : "warn"}>{v.status}</Badge>
+<Link href={`/vendors/${v.id}`} className="text-xs text-info hover:underline">posture →</Link>
+</div>
+))}
+</div>
+</Card>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/vendors/[id]/page.tsx
+```tsx
+"use client";
+import { useParams } from "next/navigation";
+import { useApi } from "../../../lib/useApi";
+import { Badge, Card, CardTitle, Skeleton } from "../../../components/ui";
+interface Posture {
+id: string; name: string; criticality: string; reviewCadenceMonths: number;
+certifications: { type: string; provider?: string | null; expiresAt?: string | null }[];
+reviews: { status: string; dpProvided: boolean; soc2ReportProvided: boolean; nextReviewDue: string }[];
+}
+export default function VendorPosturePage() {
+const { id } = useParams<{ id: string }>();
+const { data, loading } = useApi<Posture>(`/v1/vendors/${id}/posture`);
+if (loading) return <Skeleton className="h-96" />;
+if (!data) return <Card className="p-8 text-center text-muted-foreground">Vendor not found.</Card>;
+const lastReview = data.reviews[0];
+return (
+<div className="mx-auto max-w-3xl space-y-4">
+<h1 className="text-lg font-semibold">{data.name} — posture</h1>
+<Card>
+<CardTitle>Certifications</CardTitle>
+<div className="divide-y divide-border">
+{data.certifications.length === 0 && <p className="p-6 text-center text-xs text-muted-foreground">No certifications on file.</p>}
+{data.certifications.map((c, i) => {
+const exp = c.expiresAt ? new Date(c.expiresAt) : null;
+const expired = exp ? exp.getTime() < Date.now() : false;
+const expiring = exp ? exp.getTime() < Date.now() + 45 * 86400000 : false;
+return (
+<div key={i} className="flex items-center gap-3 px-4 py-3 text-[13px]">
+<span className="flex-1 font-medium">{c.type}</span>
+<span className="text-xs text-muted-foreground">{c.provider ?? ""}</span>
+{exp ? <Badge tone={expired ? "fail" : expiring ? "warn" : "pass"}>{expired ? "expired" : expiring ? "expiring" : "current"}</Badge> : <Badge tone="zinc">no expiry</Badge>}
+</div>
+);
+})}
+</div>
+</Card>
+{lastReview && (
+<Card>
+<CardTitle>Latest review</CardTitle>
+<div className="space-y-1.5 p-4 text-xs">
+<p>Status: <Badge tone={lastReview.status === "APPROVED" ? "pass" : "warn"}>{lastReview.status}</Badge></p>
+<p className="text-muted-foreground">DPA provided: {lastReview.dpProvided ? "yes" : "no"} · SOC 2 report: {lastReview.soc2ReportProvided ? "yes" : "no"}</p>
+<p className="text-muted-foreground">Next review due: {new Date(lastReview.nextReviewDue).toLocaleDateString()}</p>
+</div>
+</Card>
+)}
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/policies/page.tsx
+```tsx
+"use client";
+import { useApi } from "../../lib/useApi";
+import { Badge, Card, CardTitle, Skeleton } from "../../components/ui";
+interface PolicyRow {
+id: string; title: string; slug: string;
+currentVersion?: { version: number; status: string; generatedByAI: boolean; effectiveAt?: string | null } | null;
+}
+const ST_TONE = { APPROVED: "pass", IN_REVIEW: "warn", DRAFT: "zinc", RETIRED: "fail" } as const;
+export default function PoliciesPage() {
+const { data, loading } = useApi<PolicyRow[]>("/v1/policies");
+if (loading) return <Skeleton className="h-96" />;
+const rows = data ?? [];
+return (
+<div className="mx-auto max-w-3xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Policies</h1>
+<span className="text-xs text-muted-foreground">{rows.length} policies</span>
+</div>
+<Card>
+<CardTitle>Policy library</CardTitle>
+<div className="divide-y divide-border">
+{rows.length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No policies yet. Draft one with <code className="rounded bg-muted px-1">draft_policy</code> — AI drafts land IN_REVIEW and never auto-publish.</p>}
+{rows.map((p) => (
+<div key={p.id} className="flex items-center gap-3 px-4 py-3">
+<div className="min-w-0 flex-1">
+<p className="text-[13px] font-medium">{p.title}</p>
+<p className="text-xs text-muted-foreground">v{p.currentVersion?.version ?? 1}{p.currentVersion?.generatedByAI ? " · AI-assisted" : ""}</p>
+</div>
+{p.currentVersion?.generatedByAI && <Badge tone="draft">AI draft</Badge>}
+<Badge tone={ST_TONE[p.currentVersion?.status as keyof typeof ST_TONE] ?? "zinc"}>{p.currentVersion?.status ?? "DRAFT"}</Badge>
+</div>
+))}
+</div>
+</Card>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/radar/page.tsx
+```tsx
+"use client";
+import { useApi } from "../../lib/useApi";
+import { Badge, Card, CardTitle, Skeleton } from "../../components/ui";
+interface RegChangeRow {
+id: string; changeType: string; jurisdiction: string; summary: string;
+effectiveAt?: string | null; status: string;
+impacts?: { impactLevel: string }[];
+}
+const ST_TONE = { APPLIED: "pass", VERIFIED: "info", PENDING_REVIEW: "warn", REJECTED: "fail" } as const;
+const LVL_TONE = { CRITICAL: "fail", MAJOR: "warn", MINOR: "info", INFO: "zinc" } as const;
+export default function RadarPage() {
+const { data, loading } = useApi<RegChangeRow[]>("/v1/regulatory-changes?limit=30");
+if (loading) return <Skeleton className="h-96" />;
+const rows = data ?? [];
+return (
+<div className="mx-auto max-w-3xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Regulatory Radar</h1>
+<span className="text-xs text-muted-foreground">{rows.length} changes</span>
+</div>
+<Card>
+<CardTitle>Detected changes</CardTitle>
+<div className="divide-y divide-border">
+{rows.length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No regulatory changes detected yet (or Reg Radar requires Enterprise).</p>}
+{rows.map((c) => (
+<div key={c.id} className="px-4 py-3">
+<div className="flex items-center gap-2">
+<Badge tone="zinc">{c.jurisdiction}</Badge>
+<Badge tone="info">{c.changeType}</Badge>
+<span className="ml-auto text-xs text-muted-foreground">{c.effectiveAt ? `eff. ${new Date(c.effectiveAt).toLocaleDateString()}` : "no date"}</span>
+</div>
+<p className="mt-1.5 text-[13px]">{c.summary}</p>
+<div className="mt-1.5 flex items-center gap-1.5">
+<Badge tone={ST_TONE[c.status as keyof typeof ST_TONE] ?? "zinc"}>{c.status}</Badge>
+{c.impacts?.map((im, i) => (
+<Badge key={i} tone={LVL_TONE[im.impactLevel as keyof typeof LVL_TONE] ?? "zinc"}>{im.impactLevel}</Badge>
+))}
+</div>
+</div>
+))}
+</div>
+</Card>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/evidence/page.tsx
+```tsx
+"use client";
+import { useApi } from "../../lib/useApi";
+import { Badge, Card, CardTitle, Skeleton } from "../../components/ui";
+export default function EvidencePage() {
+const dist = useApi<Record<string, number>>("/v1/quality/distribution");
+const grades = ["A", "B", "C", "D", "F"] as const;
+const total = Object.values(dist.data ?? {}).reduce((a, b) => a + b, 0);
+return (
+<div className="mx-auto max-w-3xl space-y-4">
+<h1 className="text-lg font-semibold">Evidence</h1>
+<Card>
+<CardTitle right={dist.data && <Badge tone="pass">{total} rows graded</Badge>}>Quality distribution</CardTitle>
+<div className="space-y-2.5 p-4">
+{dist.loading ? <Skeleton /> : grades.map((g) => {
+const n = dist.data?.[g] ?? 0;
+const pct = total ? (n / total) * 100 : 0;
+return (
+<div key={g} className="flex items-center gap-2 text-xs">
+<span className="w-4 font-semibold">{g}</span>
+<div className="h-2.5 flex-1 rounded bg-muted">
+<div className={`h-2.5 rounded ${g === "A" || g === "B" ? "bg-pass" : g === "F" ? "bg-fail" : "bg-warn"}`} style={{ width: `${pct}%` }} />
+</div>
+<span className="w-12 text-right text-muted-foreground tabular-nums">{n}</span>
+</div>
+);
+})}
+{total === 0 && !dist.loading && <p className="py-4 text-center text-xs text-muted-foreground">No graded evidence yet — connect an integration or run a check.</p>}
+</div>
+</Card>
+<p className="text-xs text-muted-foreground">
+Every evidence row is hash-chained per control. Open a <a href="/controls" className="text-info hover:underline">control</a> to walk its chain and recompute the tamper proof.
+</p>
+</div>
+);
+}
+```
+### END FILE
+````
+
+**Batch 15 complete — 10 files.** Every nav item now resolves to a real screen wired to the live API:
+
+| Screen | Backed by |
+|---|---|
+| `/controls` | `list_controls` (catalog) → links into the existing detail page |
+| `/incidents` | `list_incidents` + `POST /v1/incidents/:id/obligations` → **live statutory countdown clocks** (reuses `CountdownClock`) + IR state-machine stepper |
+| `/brain` | `/v1/brain/health`, `/anomalies`, `POST /ask`, and the SSE stream — subsystem bars, anomaly list, `ask_brain` console, live feed |
+| `/vendors` + `/vendors/[id]` | `list_vendors` + `get_vendor_posture` (cert expiry + DPA status) |
+| `/policies` | `list_policies` (shows AI-draft + IN_REVIEW gating) |
+| `/radar` | `list_regulatory_changes` with impact levels + apply status |
+| `/evidence` | `/v1/quality/distribution` histogram |
+
+**Run it:**
+```bash
+python3 split.py batch15.txt
+pnpm dev   # open http://localhost:3000
+```
+
+Two honest notes: (1) there's still **no `list_questionnaires`** endpoint, so the questionnaire review screen remains reachable only by direct URL (`/questionnaires/{id}/review`) — say the word and I'll add a list route + index page. (2) The `/tasks` auto-verify screen from Batch 12 reads real tasks; the hourly verification sweep is what flips them, so mark one done and wait for the workers' `remediationVerifyWorkflow` to see it reopen on a failing check.
+
+What's next — the **questionnaires list page**, the **P0 production hardening** (Redis rate limiter, CORS/CSRF, SES notify, S3 presign), or **integration tests** between the handlers and these screens?

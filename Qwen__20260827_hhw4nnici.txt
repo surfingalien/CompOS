@@ -1,0 +1,525 @@
+### FILE: packages/brain/src/riaDrift.ts
+```typescript
+import { prisma } from "@db/client";
+import { brainDb } from "./brainDb";
+import type { AnomalyDraft } from "./anomaly";
+const DAY = 86_400_000;
+/**
+* RIA DRIFT DETECTOR — the "monitor" end of the monitor→reflex→review loop.
+* Reads the RIA learning signals + retrieval calibration from the main DB and
+* surfaces extraction-quality drift as Brain anomalies.
+*
+* Two drift signals:
+*  1. rejection-rate drift: rising share of expert REJECTED over 7 days
+*  2. precision drift: golden-set precision below the healthy floor (0.92)
+*
+* CRITICAL drift is escalated by reflexes.ts into a BrainIncident + an
+* expert review item (RIA_DRIFT) — the review console is where a human
+* adjudicates, completing the loop.
+*/
+export async function riaDriftDetector(): Promise<AnomalyDraft[]> {
+const out: AnomalyDraft[] = [];
+const since = new Date(Date.now() - 7 * DAY);
+// ── signal 1: rejection-rate drift ──
+const [total, rejected] = await Promise.all([
+prisma.regLearningSignal.count({ where: { createdAt: { gte: since } } }),
+prisma.regLearningSignal.count({
+where: { createdAt: { gte: since }, expertDecision: "REJECTED" } }),
+]).catch(() => [0, 0] as [number, number]);
+if (total >= 10) {
+const rate = rejected / total;
+if (rate > 0.15) {
+out.push({
+detector: "ria-drift", subsystem: "ria", metric: "rejection_rate_7d",
+value: Math.round(rate * 1000) / 1000, baseline: 0.15,
+severity: rate > 0.30 ? "CRITICAL" : "WARN",
+details: { rejected, total, window: "7d" },
+});
+}
+}
+// ── signal 2: retrieval precision drift (per-org calibration) ──
+const configs = await prisma.retrievalConfig.findMany({
+where: { reindexing: false } }).catch(() => []);
+for (const cfg of configs.slice(0, 50)) {
+const cal = cfg.calibration as { precision?: number } | null;
+const precision = cal?.precision;
+if (precision !== undefined && precision !== null && precision < 0.92) {
+out.push({
+detector: "ria-drift", subsystem: "ria", metric: "retrieval_precision",
+orgId: cfg.orgId,
+value: Math.round(precision * 1000) / 1000, baseline: 0.92,
+severity: precision < 0.85 ? "CRITICAL" : "WARN",
+details: { orgId: cfg.orgId, precision, threshold: 0.92 },
+});
+}
+}
+return dedupeRia(out);
+}
+/** Don't re-open what's already OPEN (same metric+org within 24h). */
+async function dedupeRia(drafts: AnomalyDraft[]): Promise<AnomalyDraft[]> {
+if (drafts.length === 0) return drafts;
+const open = await brainDb.anomaly.findMany({
+where: { status: "OPEN", detector: "ria-drift",
+at: { gte: new Date(Date.now() - DAY) } },
+select: { metric: true, orgId: true },
+});
+const keys = new Set(open.map((a) => `${a.metric}|${a.orgId ?? ""}`));
+return drafts.filter((d) => !keys.has(`${d.metric}|${d.orgId ?? ""}`));
+}
+```
+### END FILE
+### FILE: packages/brain/src/anomaly.ts
+```typescript
+// OVERRIDE (batch 17) — adds riaDriftDetector as the 6th detector so RIA
+// extraction drift flows through the same anomaly→reflex pipeline.
+import { brainDb } from "./brainDb";
+import { riaDriftDetector } from "./riaDrift";
+export interface AnomalyDraft {
+detector: string; subsystem: string; metric: string; orgId?: string | null;
+value: number; baseline: number; zScore?: number;
+severity: "WARN" | "CRITICAL"; details?: Record<string, unknown>;
+}
+const DAY = 86_400_000;
+export async function runDetectors(): Promise<AnomalyDraft[]> {
+const out: AnomalyDraft[] = [];
+out.push(...await silenceDetector());
+out.push(...await errorRateDetector());
+out.push(...await costDetector());
+out.push(...await freshnessDetector());
+out.push(...await stuckFlowDetector());
+out.push(...await riaDriftDetector()); // ← RIA extraction drift
+return dedupeAgainstOpen(out);
+}
+async function silenceDetector(): Promise<AnomalyDraft[]> {
+const sources = await brainDb.$queryRaw<Array<{ source: string; last: Date; p50h: number }>>`
+WITH gaps AS (
+SELECT source, at - lag(at) OVER (PARTITION BY source ORDER BY at) AS gap
+FROM "BrainEvent" WHERE at > now() - interval '7 days')
+SELECT source, max(gap) AS last,
+percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM gap) / 3600) AS p50h
+FROM gaps WHERE gap IS NOT NULL GROUP BY source
+HAVING percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM gap) / 3600) > 0`;
+return sources
+.filter((s) => (Date.now() - s.last.getTime()) / 3_600_000 > s.p50h * 3)
+.map((s) => ({
+detector: "silence", subsystem: s.source, metric: "hours_since_last_event",
+value: Math.round(((Date.now() - s.last.getTime()) / 3_600_000) * 10) / 10,
+baseline: Math.round(s.p50h * 10) / 10,
+severity: "CRITICAL" as const, details: { lastAt: s.last.toISOString() },
+}));
+}
+async function errorRateDetector(): Promise<AnomalyDraft[]> {
+const rows = await brainDb.$queryRaw<Array<{
+source: string; hr: Date; errs: bigint; total: bigint }>>`
+SELECT source, date_trunc('hour', at) AS hr,
+COUNT(*) FILTER (WHERE severity IN ('ERROR','CRITICAL')) AS errs, COUNT(*) AS total
+FROM "BrainEvent" WHERE at > now() - interval '8 days'
+GROUP BY 1, 2 ORDER BY 1, 2`;
+const bySource = new Map<string, number[]>();
+const current = new Map<string, { errs: number; total: number }>();
+const hourAgo = Date.now() - 3_600_000;
+for (const r of rows) {
+const share = Number(r.errs) / Math.max(Number(r.total), 1);
+if (r.hr.getTime() >= hourAgo) {
+const c = current.get(r.source) ?? { errs: 0, total: 0 };
+c.errs += Number(r.errs); c.total += Number(r.total); current.set(r.source, c);
+} else bySource.set(r.source, [...(bySource.get(r.source) ?? []), share]);
+}
+const out: AnomalyDraft[] = [];
+for (const [src, c] of current) {
+if (c.total < 10) continue;
+const baseline = bySource.get(src) ?? [];
+if (baseline.length < 24) continue;
+const x = c.errs / c.total;
+const μ = baseline.reduce((a, b) => a + b, 0) / baseline.length;
+const σ = Math.sqrt(baseline.reduce((s, v) => s + (v - μ) ** 2, 0) / baseline.length) || 1e-9;
+const z = (x - μ) / σ;
+if (z >= 2 && x > 0.05)
+out.push({ detector: "rate", subsystem: src, metric: "hourly_error_share",
+value: Math.round(x * 1000) / 1000, baseline: Math.round(μ * 1000) / 1000,
+zScore: Math.round(z * 10) / 10, severity: "WARN" });
+}
+return out;
+}
+async function costDetector(): Promise<AnomalyDraft[]> {
+const rows = await brainDb.$queryRaw<Array<{ hr: Date; cost: number | null }>>`
+SELECT date_trunc('hour', at) AS hr,
+SUM((payload->>'costUsd')::float) AS cost
+FROM "BrainEvent" WHERE type = 'llm.generation.completed'
+AND at > now() - interval '8 days'
+GROUP BY 1 ORDER BY 1`;
+const hourAgo = Date.now() - 3_600_000;
+const baseline = rows.filter((r) => r.hr.getTime() < hourAgo).map((r) => r.cost ?? 0);
+const current = rows.filter((r) => r.hr.getTime() >= hourAgo)
+.reduce((s, r) => s + (r.cost ?? 0), 0);
+if (baseline.length < 24 || current <= 0) return [];
+const μ = baseline.reduce((a, b) => a + b, 0) / baseline.length;
+const σ = Math.sqrt(baseline.reduce((s, v) => s + (v - μ) ** 2, 0) / baseline.length) || 1e-9;
+const z = (current - μ) / σ;
+if (z < 2) return [];
+return [{ detector: "cost", subsystem: "llm", metric: "dollars_per_hour",
+value: Math.round(current * 100) / 100, baseline: Math.round(μ * 100) / 100,
+zScore: Math.round(z * 10) / 10, severity: "WARN",
+details: { hint: "Check agent budgets / runaway generation loops" } }];
+}
+async function freshnessDetector(): Promise<AnomalyDraft[]> {
+const rows = await brainDb.$queryRaw<Array<{
+orgId: string; controlSlug: string; last: Date; orgActive: Date }>>`
+WITH tests AS (
+SELECT "orgId", payload->>'controlSlug' AS slug, max(at) AS last
+FROM "BrainEvent"
+WHERE type IN ('control.test.passed','control.test.failed') AND "orgId" IS NOT NULL
+GROUP BY 1, 2),
+orgs AS (
+SELECT "orgId", max(at) AS "orgActive" FROM "BrainEvent"
+WHERE "orgId" IS NOT NULL GROUP BY 1)
+SELECT t."orgId", t.slug AS "controlSlug", t.last, o."orgActive"
+FROM tests t JOIN orgs o ON o."orgId" = t."orgId"
+WHERE t.last < now() - interval '90 days'
+AND o."orgActive" > now() - interval '7 days'`;
+return rows.map((r) => ({
+detector: "freshness", subsystem: "check_runner", orgId: r.orgId,
+metric: "days_since_last_test",
+value: Math.floor((Date.now() - r.last.getTime()) / DAY),
+baseline: 90, severity: "WARN" as const,
+details: { controlSlug: r.controlSlug },
+}));
+}
+async function stuckFlowDetector(): Promise<AnomalyDraft[]> {
+const rows = await brainDb.$queryRaw<Array<{ day: Date; n: bigint }>>`
+SELECT date_trunc('day', "startedAt") AS day, COUNT(*) AS n
+FROM "FlowRun" WHERE status = 'STUCK' AND "startedAt" > now() - interval '8 days'
+GROUP BY 1 ORDER BY 1`;
+const today = rows.find((r) => r.day.getTime() >= Date.now() - DAY)?.n ?? 0n;
+const baseline = rows.filter((r) => r.day.getTime() < Date.now() - DAY)
+.map((r) => Number(r.n));
+if (baseline.length < 3) return [];
+const μ = baseline.reduce((a, b) => a + b, 0) / baseline.length;
+const σ = Math.sqrt(baseline.reduce((s, v) => s + (v - μ) ** 2, 0) / baseline.length) || 1e-9;
+const z = (Number(today) - μ) / σ;
+if (z < 2 || Number(today) === 0) return [];
+return [{ detector: "zscore", subsystem: "temporal", metric: "stuck_flows_today",
+value: Number(today), baseline: Math.round(μ * 10) / 10,
+zScore: Math.round(z * 10) / 10, severity: "WARN" }];
+}
+async function dedupeAgainstOpen(drafts: AnomalyDraft[]): Promise<AnomalyDraft[]> {
+// RIA drift has its own dedupe (org-scoped); skip the global one for it.
+const ria = drafts.filter((d) => d.detector === "ria-drift");
+const rest = drafts.filter((d) => d.detector !== "ria-drift");
+const open = await brainDb.anomaly.findMany({
+where: { status: "OPEN", at: { gte: new Date(Date.now() - DAY) } },
+select: { detector: true, subsystem: true, metric: true } });
+const keys = new Set(open.map((a) => `${a.detector}|${a.subsystem}|${a.metric}`));
+return [...ria, ...rest.filter((d) => !keys.has(`${d.detector}|${d.subsystem}|${d.metric}`))];
+}
+```
+### END FILE
+### FILE: packages/brain/src/reflexes.ts
+```typescript
+// OVERRIDE (batch 17) — adds the RIA-drift reflex: CRITICAL extraction drift
+// auto-opens a BrainIncident AND enqueues an expert review item (RIA_DRIFT),
+// closing the monitor→reflex→review loop. Reflexes still touch operational
+// state only (anomalies, incidents, review queue) — never compliance content.
+import { prisma } from "@db/client";
+import { brainDb } from "./brainDb";
+import { emit } from "./emit";
+import type { AnomalyDraft } from "./anomaly";
+import { diagnoseIncident } from "./agents/diagnostician";
+const DAY = 86_400_000;
+async function reflex(rule: string, trigger: string, action: string,
+detail?: Record<string, unknown>) {
+const result = await runReflex(rule, trigger, action, detail);
+await brainDb.reflexLog.create({ data: { rule, trigger, action, result,
+detail: (detail ?? {}) as object } });
+emit({ type: "brain.reflex.executed", source: "brain",
+payload: { rule, action, result } });
+}
+async function runReflex(_rule: string, _trigger: string, action: string,
+_detail?: Record<string, unknown>): Promise<string> {
+try {
+switch (action) {
+case "pause_connector": return await pauseStaleConnectors();
+case "page": return await page();
+case "open_ria_review": return "EXECUTED (review item enqueued)";
+default: return "SKIPPED";
+}
+} catch (e) { return `FAILED: ${String(e).slice(0, 200)}`; }
+}
+/** Enqueue an expert review item for RIA drift (idempotent by sourceId). */
+async function openRiaDriftReview(anomaly: {
+id: string; metric: string; orgId: string | null;
+value: number; baseline: number; details: unknown;
+}) {
+const sourceId = `ria-drift:${anomaly.id}`;
+const existing = await prisma.reviewItem.findUnique({ where: { sourceId } })
+.catch(() => null);
+if (existing) return;
+await prisma.reviewItem.create({
+data: {
+queueType: "RIA_DRIFT" as never,
+sourceId,
+title: `RIA extraction drift: ${anomaly.metric} = ${anomaly.value} (baseline ${anomaly.baseline})`,
+priority: "CRITICAL",
+confidence: anomaly.value,
+slaDueAt: new Date(Date.now() + 2 * DAY),
+preview: { metric: anomaly.metric, value: anomaly.value,
+baseline: anomaly.baseline, orgId: anomaly.orgId,
+details: anomaly.details } as object,
+},
+}).catch(() => {});
+}
+export async function processAnomalies(drafts: AnomalyDraft[]) {
+const created: string[] = [];
+for (const d of drafts) {
+const a = await brainDb.anomaly.create({ data: {
+detector: d.detector, subsystem: d.subsystem, metric: d.metric,
+orgId: d.orgId ?? null, value: d.value, baseline: d.baseline,
+zScore: d.zScore, severity: d.severity, details: (d.details ?? {}) as object } });
+created.push(a.id);
+emit({ type: "brain.anomaly.opened", source: "brain", orgId: d.orgId ?? undefined,
+severityOverride: d.severity as "WARN" | "CRITICAL",
+payload: { anomalyId: a.id, ...d } });
+// ── RIA drift reflex: CRITICAL → incident + expert review ──
+if (d.detector === "ria-drift") {
+if (d.severity === "CRITICAL") {
+const incident = await brainDb.brainIncident.create({ data: {
+orgId: d.orgId ?? null,
+title: `RIA extraction drift: ${d.metric} ${d.value} (baseline ${d.baseline})`,
+anomalyIds: [a.id] } });
+await brainDb.anomaly.update({ where: { id: a.id },
+data: { incidentId: incident.id } });
+emit({ type: "brain.incident.opened", source: "brain",
+orgId: d.orgId ?? undefined, severityOverride: "CRITICAL",
+payload: { incidentId: incident.id, kind: "ria-drift" } });
+await openRiaDriftReview({ id: a.id, metric: d.metric, orgId: d.orgId ?? null,
+value: d.value, baseline: d.baseline, details: d.details });
+await reflex("ria_drift_review", a.id, "open_ria_review",
+{ anomalyId: a.id, metric: d.metric });
+await reflex("critical_page", incident.id, "page",
+{ incidentId: incident.id, title: incident.title });
+void diagnoseIncident(incident.id).catch(() => {});
+}
+continue; // non-critical RIA drift stays as an open anomaly only
+}
+// ── existing reflexes ──
+if (d.detector === "silence" && d.subsystem === "connector")
+await reflex("silence_pause", a.id, "pause_connector", d.details);
+if (d.severity === "CRITICAL") {
+const incident = await brainDb.brainIncident.create({ data: {
+orgId: d.orgId ?? null,
+title: `${d.subsystem}: ${d.metric} anomaly (${d.value} vs baseline ${d.baseline})`,
+anomalyIds: [a.id] } });
+await brainDb.anomaly.update({ where: { id: a.id }, data: { incidentId: incident.id } });
+emit({ type: "brain.incident.opened", source: "brain", orgId: d.orgId ?? undefined,
+severityOverride: "CRITICAL", payload: { incidentId: incident.id } });
+await reflex("critical_page", incident.id, "page",
+{ incidentId: incident.id, title: incident.title });
+void diagnoseIncident(incident.id).catch(() => {});
+}
+}
+return { created };
+}
+async function pauseStaleConnectors(): Promise<string> {
+const r = await prisma.integration.updateMany({
+where: { status: "CONNECTED",
+lastSyncAt: { lt: new Date(Date.now() - 24 * 3_600_000) } },
+data: { status: "ERROR", syncError: "brain reflex: connector silence — auto-paused" } });
+emit({ type: "connector.paused", source: "brain",
+payload: { paused: r.count, reason: "silence" } });
+return `EXECUTED (${r.count} paused)`;
+}
+async function page(): Promise<string> {
+const url = process.env.PAGERDUTY_WEBHOOK;
+if (!url) { console.warn("[brain:reflex] CRITICAL anomaly — no PAGERDUTY_WEBHOOK configured, logging only"); return "SKIPPED (no pager configured)"; }
+const res = await fetch(url, { method: "POST",
+headers: { "content-type": "application/json" },
+body: JSON.stringify({ event_action: "trigger",
+payload: { summary: "Compliance platform brain: CRITICAL anomaly",
+source: "brain", severity: "critical" } }) });
+return res.ok ? "EXECUTED" : `FAILED (${res.status})`;
+}
+```
+### END FILE
+### FILE: packages/review/src/sources/riaDrift.ts
+```typescript
+import { prisma } from "@db/client";
+import { ReviewSource, RenderBundle } from "./types";
+/**
+* RIA_DRIFT review source — the "review" end of the monitor→reflex→review
+* loop. Items are enqueued by the Brain reflex (not scanAllQueues), so
+* scanAndEnqueue is a no-op. Approve → recalibrate retrieval thresholds for
+* the affected org. Reject → mark the anomaly FALSE_POSITIVE so the detector
+* doesn't re-fire.
+*/
+export const riaDriftSource: ReviewSource = {
+queueType: "RIA_DRIFT" as never,
+async scanAndEnqueue() { return { enqueued: 0 }; },
+async render(sourceId): Promise<RenderBundle> {
+const item = await prisma.reviewItem.findUnique({ where: { sourceId } });
+const preview = (item?.preview ?? {}) as {
+metric?: string; value?: number; baseline?: number;
+orgId?: string; details?: Record<string, unknown> };
+return {
+header: { title: item?.title ?? "RIA extraction drift",
+source: "Brain reflex (ria-drift detector)" },
+body: [
+{ kind: "evidence-quote", quotes: [
+{ source: "RIA learning loop",
+text: `Metric "${preview.metric}" drifted to ${preview.value} ` +
+`(healthy baseline ${preview.baseline}).` +
+(preview.orgId ? ` Affects org ${preview.orgId}.` : " Platform-wide.") },
+]},
+{ kind: "impact-list", items: [
+{ label: "Auto-opened a Brain incident + diagnosis", level: "CRITICAL" },
+{ label: "Approving recalibrates retrieval thresholds (calibrate)",
+level: "MAJOR", action: "Recalibrate on approval" },
+{ label: "Rejecting marks the anomaly FALSE_POSITIVE", level: "INFO" },
+]},
+],
+risk: ["Expert adjudication required: confirm the drift is real (not a " +
+"transient spike) before recalibrating thresholds."],
+};
+},
+async approve(sourceId, _reviewer, _note) {
+const item = await prisma.reviewItem.findUnique({ where: { sourceId } });
+const preview = (item?.preview ?? {}) as { orgId?: string };
+// Recalibrate retrieval thresholds for the affected org (dynamic import —
+// @review does not hard-depend on @questionnaire).
+if (preview.orgId) {
+try {
+const { calibrate } = await import("@questionnaire");
+await calibrate(preview.orgId);
+} catch (e) {
+console.warn(`[riaDrift] recalibration skipped: ${String(e).slice(0, 120)}`);
+}
+}
+// Resolve the linked anomaly
+const anomalyId = sourceId.replace("ria-drift:", "");
+const { brainDb } = await import("@brain");
+await brainDb.anomaly.update({ where: { id: anomalyId },
+data: { status: "RESOLVED" } }).catch(() => {});
+return { applied: "RIA_RECALIBRATED", orgId: preview.orgId ?? null };
+},
+async reject(sourceId, _reviewer, _note) {
+const anomalyId = sourceId.replace("ria-drift:", "");
+const { brainDb } = await import("@brain");
+await brainDb.anomaly.update({ where: { id: anomalyId },
+data: { status: "FALSE_POSITIVE" } }).catch(() => {});
+},
+};
+```
+### END FILE
+### FILE: packages/review/src/engine.ts
+```typescript
+// OVERRIDE (batch 17) — registers riaDriftSource so the review console
+// renders/adjudicates RIA drift items enqueued by the Brain reflex.
+import { prisma } from "@db/client";
+import { emit } from "@brain/emit";
+import type { ReviewerCredential } from "@prisma/client";
+import { frameworkContentSource } from "./sources/frameworkContent";
+import { matrixProposalSource } from "./sources/matrixProposal";
+import { regChangeSource } from "./sources/regChange";
+import { riaDriftSource } from "./sources/riaDrift";
+import type { ReviewSource } from "./sources/types";
+export const SOURCES: Record<string, ReviewSource> = {
+FRAMEWORK_CONTENT: frameworkContentSource,
+MATRIX_PROPOSAL: matrixProposalSource,
+REG_CHANGE: regChangeSource,
+RIA_DRIFT: riaDriftSource,
+};
+export class Conflict extends Error {}
+export class NotFoundError extends Error {}
+async function record(itemId: string, actorMembershipId: string | null,
+action: string, note?: string) {
+await prisma.reviewDecision.create({
+data: { reviewItemId: itemId, actorMembershipId: actorMembershipId ?? "",
+action, note } });
+}
+async function assertCredential(membershipId: string, credential: ReviewerCredential | null) {
+if (!credential) return;
+const profile = await prisma.reviewerProfile.findUnique({ where: { membershipId } });
+if (!profile?.active || !profile.credentials.includes(credential))
+throw new Conflict(`This item requires the ${credential} credential`);
+}
+async function finalize(itemId: string, reviewerMembershipId: string | null,
+status: string, note?: string) {
+await prisma.reviewItem.update({
+where: { id: itemId },
+data: { status: status as never, decidedByMembershipId: reviewerMembershipId ?? "",
+decidedAt: new Date(), decisionNote: note, claimedByMembershipId: null } });
+await record(itemId, reviewerMembershipId, status, note);
+}
+export async function scanAllQueues() {
+const results = await Promise.all(Object.values(SOURCES).map((s) => s.scanAndEnqueue()));
+return { enqueued: results.reduce((s, r) => s + r.enqueued, 0) };
+}
+export async function claim(itemId: string, reviewerMembershipId: string) {
+const item = await prisma.reviewItem.findUniqueOrThrow({ where: { id: itemId } });
+if (item.status !== "PENDING") throw new Conflict("Item not claimable");
+await assertCredential(reviewerMembershipId, item.requiredCredential);
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "CLAIMED", claimedByMembershipId: reviewerMembershipId,
+claimedAt: new Date() } });
+await record(itemId, reviewerMembershipId, "CLAIM");
+emit({ type: "review.item.enqueued", source: "review",
+payload: { reviewItemId: itemId, claimed: true } });
+return item;
+}
+export async function decide(itemId: string, reviewerMembershipId: string,
+decision: "APPROVE" | "REJECT" | "DEFER", note: string, deferUntil?: Date) {
+const item = await prisma.reviewItem.findUniqueOrThrow({ where: { id: itemId } });
+await assertCredential(reviewerMembershipId, item.requiredCredential);
+const source = SOURCES[item.queueType];
+if (!source) throw new NotFoundError(`No source for queue ${item.queueType}`);
+if (decision === "DEFER") {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "PENDING", deferredUntil: deferUntil, claimedByMembershipId: null } });
+await record(itemId, reviewerMembershipId, "DEFER", note);
+return { status: "DEFERRED" };
+}
+if (decision === "REJECT") {
+await source.reject(item.sourceId, reviewerMembershipId, note);
+await finalize(itemId, reviewerMembershipId, "REJECTED", note);
+return { status: "REJECTED" };
+}
+if (item.priority === "CRITICAL") {
+if (!item.firstApprovalBy) {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "APPROVED_PENDING_SECOND", firstApprovalBy: reviewerMembershipId,
+firstApprovalAt: new Date() } });
+await record(itemId, reviewerMembershipId, "APPROVE_FIRST", note);
+emit({ type: "review.item.overdue", source: "review",
+payload: { reviewItemId: itemId, awaiting: "second-approver" } });
+return { status: "APPROVED_PENDING_SECOND" };
+}
+if (item.firstApprovalBy === reviewerMembershipId)
+throw new Conflict("Four-eyes: second approval must come from a different reviewer");
+}
+const result = await source.approve(item.sourceId, reviewerMembershipId, note,
+!!item.firstApprovalBy);
+await finalize(itemId, reviewerMembershipId, "APPROVED", note);
+return result ?? { status: "APPROVED" };
+}
+export async function supersedeOnConflict(newProposalId: string, stateRuleId: string) {
+const stale = await prisma.reviewItem.findMany({
+where: { queueType: "MATRIX_PROPOSAL",
+status: { in: ["PENDING", "CLAIMED", "APPROVED_PENDING_SECOND"] },
+sourceId: { not: newProposalId } } });
+let superseded = 0;
+for (const item of stale) {
+const p = await prisma.matrixAmendmentProposal.findUnique({ where: { id: item.sourceId } });
+if (p?.stateRuleId !== stateRuleId) continue;
+await prisma.matrixAmendmentProposal.update({ where: { id: p.id },
+data: { status: "SUPERSEDED" } });
+await finalize(item.id, null, "SUPERSEDED", `Superseded by ${newProposalId}`);
+superseded++;
+}
+return { superseded };
+}
+export async function releaseClaim(itemId: string, reviewerMembershipId: string) {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "PENDING", claimedByMembershipId: null } });
+await record(itemId, reviewerMembershipId, "RELEASE");
+}
+```
+### END FILE

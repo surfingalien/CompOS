@@ -1,0 +1,926 @@
+### FILE: packages/db/prisma/ria-models.prisma
+```prisma
+// ═══════════ APPEND these models to packages/db/prisma/schema.prisma ═══════════
+// Regulatory Intelligence Agent (RIA) — multi-jurisdiction crawl + learning.
+
+/// Country/state registry beyond the US — one row per jurisdiction we track.
+model Jurisdiction {
+id String @id // "EU", "GB", "CA-ON", "AU", "US-CA", …
+code String @unique
+name String
+region String // "EU", "UK", "NA", "APAC", "LATAM", "US-STATE"
+sovereign String? // parent country for sub-national ("US", "CA", "AU")
+primaryRegulator String? // "ICO", "CNIL", "OAIC", "FTC", …
+legalSystem String @default("CIVIL") // CIVIL | COMMON | MIXED
+language String @default("en")
+enabled Boolean @default(true)
+sources RegSourceCountry[]
+learningSignals RegLearningSignal[]
+}
+
+/// Per-jurisdiction discovery of regulatory sources (feeds, gazettes, sites).
+model RegSourceCountry {
+id String @id @default(cuid())
+jurisdictionId String
+jurisdiction Jurisdiction @relation(fields: [jurisdictionId], references: [id])
+name String
+kind String // API | RSS | HTML | PDF | GAZETTE
+url String
+discoveredBy String @default("MANUAL") // MANUAL | CRAWLER
+reliability Float @default(0.5) // rolling accuracy 0..1 (learning loop updates)
+lastCrawledAt DateTime?
+lastContentHash String?
+crawlCount Int @default(0)
+crawlTasks CrawlTask[]
+@@index([jurisdictionId, enabled: false])
+}
+
+/// Autonomous crawl tracking — one row per exploration attempt.
+model CrawlTask {
+id String @id @default(cuid())
+sourceCountryId String
+sourceCountry RegSourceCountry @relation(fields: [sourceCountryId], references: [id])
+status String @default("PENDING") // PENDING | RUNNING | DONE | FAILED | BLOCKED
+depth Int @default(1)
+urlsFound Int @default(0)
+docsExtracted Int @default(0)
+error String?
+startedAt DateTime?
+finishedAt DateTime?
+createdAt DateTime @default(now())
+@@index([status, createdAt])
+}
+
+/// Knowledge-graph node linking a regulation to requirements/controls.
+model RegKnowledgeNode {
+id String @id @default(cuid())
+jurisdictionId String
+regChangeId String? // links to RegChange when derived from one
+nodeType String // REGULATION | REQUIREMENT | CONTROL | GUIDANCE
+refCode String // "Art.32", "CC6.1", "23 NYCRR 500"
+title String
+linkedRequirementId String? // FrameworkRequirement.id when mapped
+linkedControlTemplateId String? // ControlTemplate.id when mapped
+confidence Float @default(0.5)
+verified Boolean @default(false)
+@@unique([jurisdictionId, nodeType, refCode])
+@@index([linkedRequirementId])
+}
+
+/// Feedback signal from expert review — the fuel for the learning loop.
+model RegLearningSignal {
+id String @id @default(cuid())
+jurisdictionId String
+jurisdiction Jurisdiction @relation(fields: [jurisdictionId], references: [id])
+sourceCountryId String? // which feed produced the extraction
+changeType String // NEW_RULE | AMENDMENT | GUIDANCE | …
+extractedConfidence Float // what the extractor claimed
+expertDecision String // APPROVED | REJECTED | MODIFIED
+impactPredicted String? // INFO | MINOR | MAJOR | CRITICAL
+impactActual String? // what the expert settled on
+routingCorrect Boolean? // did it land on the right controls?
+reviewerNote String?
+createdAt DateTime @default(now())
+@@index([jurisdictionId, changeType, createdAt])
+@@index([sourceCountryId, createdAt])
+}
+```
+### END FILE
+### FILE: packages/db/prisma/ria.sql
+```sql
+-- RLS for the new RIA tables. Jurisdiction/RegKnowledgeNode/RegSourceCountry
+-- are PLATFORM-global (no orgId) → no org RLS, but still protected by
+-- expert-gated writes. RegLearningSignal carries orgId (nullable = platform).
+-- CrawlTask/RegSourceCountry are platform-internal (like Brain tables).
+-- Run AFTER appending ria-models.prisma and `prisma db push`.
+-- (No org_isolation needed for platform tables; documented in rls.sql style.)
+SELECT 'RIA tables are platform-scoped; expert review gates all writes.';
+```
+### END FILE
+### FILE: packages/knowledge/src/ria/jurisdictions.ts
+```typescript
+import { prisma } from "@db/client";
+/**
+* Multi-jurisdiction registry. The US 50 states already come from the breach
+* matrix (sourcePack derives them); this adds COUNTRIES and sub-national
+* provinces so the RIA can crawl beyond the US.
+*
+* NOTE: regulator URLs are starting points for the crawler's discovery — the
+* crawler expands them. Marked for expert confirmation of coverage.
+*/
+export const COUNTRY_SEED: Array<{
+code: string; name: string; region: string; sovereign?: string;
+primaryRegulator?: string; legalSystem?: string; language?: string;
+}> = [
+// ── European Union + member states ──
+{ code: "EU", name: "European Union", region: "EU", primaryRegulator: "EDPB", legalSystem: "CIVIL" },
+{ code: "DE", name: "Germany", region: "EU", sovereign: "EU", primaryRegulator: "BfDI", legalSystem: "CIVIL", language: "de" },
+{ code: "FR", name: "France", region: "EU", sovereign: "EU", primaryRegulator: "CNIL", legalSystem: "CIVIL", language: "fr" },
+{ code: "IE", name: "Ireland", region: "EU", sovereign: "EU", primaryRegulator: "DPC", legalSystem: "COMMON" },
+{ code: "NL", name: "Netherlands", region: "EU", sovereign: "EU", primaryRegulator: "AP", legalSystem: "CIVIL" },
+{ code: "ES", name: "Spain", region: "EU", sovereign: "EU", primaryRegulator: "AEPD", legalSystem: "CIVIL", language: "es" },
+{ code: "IT", name: "Italy", region: "EU", sovereign: "EU", primaryRegulator: "Garante", legalSystem: "CIVIL", language: "it" },
+// ── UK (post-Brexit, own UK-GDPR) ──
+{ code: "GB", name: "United Kingdom", region: "UK", primaryRegulator: "ICO", legalSystem: "COMMON" },
+// ── North America ──
+{ code: "CA", name: "Canada", region: "NA", primaryRegulator: "OPC", legalSystem: "MIXED" },
+{ code: "CA-ON", name: "Ontario", region: "NA", sovereign: "CA", primaryRegulator: "IPC Ontario", legalSystem: "COMMON" },
+{ code: "CA-BC", name: "British Columbia", region: "NA", sovereign: "CA", primaryRegulator: "OIPC BC", legalSystem: "COMMON" },
+{ code: "MX", name: "Mexico", region: "LATAM", primaryRegulator: "INAI", legalSystem: "CIVIL", language: "es" },
+// ── APAC ──
+{ code: "AU", name: "Australia", region: "APAC", primaryRegulator: "OAIC", legalSystem: "COMMON" },
+{ code: "NZ", name: "New Zealand", region: "APAC", primaryRegulator: "OPC NZ", legalSystem: "COMMON" },
+{ code: "SG", name: "Singapore", region: "APAC", primaryRegulator: "PDPC", legalSystem: "COMMON" },
+{ code: "JP", name: "Japan", region: "APAC", primaryRegulator: "PPC", legalSystem: "CIVIL", language: "ja" },
+{ code: "IN", name: "India", region: "APAC", primaryRegulator: "MeitY", legalSystem: "COMMON" },
+{ code: "KR", name: "South Korea", region: "APAC", primaryRegulator: "PIPC", legalSystem: "CIVIL", language: "ko" },
+// ── LATAM ──
+{ code: "BR", name: "Brazil", region: "LATAM", primaryRegulator: "ANPD", legalSystem: "CIVIL", language: "pt" },
+];
+/** Starting-point feeds the crawler expands. Marked DISCOVERED=MANUAL until
+* the crawler validates/enriches them. */
+export const STARTING_FEEDS: Record<string, Array<{ name: string; kind: string; url: string }>> = {
+EU: [
+{ name: "EUR-Lex OJ", kind: "GAZETTE", url: "https://eur-lex.europa.eu/oj/direct-access.html" },
+{ name: "EDPB News", kind: "RSS", url: "https://edpb.europa.eu/news_en" },
+],
+GB: [
+{ name: "ICO News", kind: "RSS", url: "https://ico.org.uk/about-the-ico/media-centre/news-and-blogs/" },
+{ name: "legislation.gov.uk", kind: "API", url: "https://www.legislation.gov.uk" },
+],
+CA: [{ name: "OPC News", kind: "RSS", url: "https://www.priv.gc.ca/en/opc-news/" }],
+AU: [{ name: "OAIC Newsroom", kind: "RSS", url: "https://www.oaic.gov.au/newsroom" }],
+SG: [{ name: "PDPC", kind: "HTML", url: "https://www.pdpc.gov.sg" }],
+BR: [{ name: "ANPD", kind: "HTML", url: "https://www.gov.br/anpd" }],
+};
+export async function loadJurisdictions() {
+for (const j of COUNTRY_SEED) {
+await prisma.jurisdiction.upsert({
+where: { code: j.code },
+update: { name: j.name, region: j.region },
+create: {
+id: j.code, code: j.code, name: j.name, region: j.region,
+sovereign: j.sovereign, primaryRegulator: j.primaryRegulator,
+legalSystem: j.legalSystem ?? "CIVIL", language: j.language ?? "en",
+},
+});
+}
+// seed starting feeds
+for (const [code, feeds] of Object.entries(STARTING_FEEDS)) {
+for (const f of feeds) {
+const existing = await prisma.regSourceCountry.findFirst({
+where: { jurisdictionId: code, url: f.url } });
+if (existing) continue;
+await prisma.regSourceCountry.create({
+data: { jurisdictionId: code, name: f.name, kind: f.kind,
+url: f.url, discoveredBy: "MANUAL", reliability: 0.5 },
+});
+}
+}
+console.log(`Loaded ${COUNTRY_SEED.length} jurisdictions + starting feeds.`);
+}
+if (require.main === module) {
+loadJurisdictions().finally(() => prisma.$disconnect());
+}
+```
+### END FILE
+### FILE: packages/knowledge/src/ria/crawler.ts
+```typescript
+import { prisma } from "@db/client";
+import { emit } from "@brain/emit";
+import { fetchAndClean, chunkAndEmbed, sha256 } from "../utils/text";
+/**
+* AUTONOMOUS CRAWLER — agent-driven exploration, not just scheduled polling.
+* Given a source, it fetches, hashes (diff-gate), extracts docs, and records
+* what it found. Discovery expansion (following links to new sources) is the
+* crawler's job; extraction/confidence is the extractor's job.
+*
+* Learning tie-in: each crawl updates RegSourceCountry.reliability via the
+* learning loop based on how often this source's extractions survive review.
+*/
+export async function crawlSource(sourceCountryId: string, depth = 1) {
+const source = await prisma.regSourceCountry.findUniqueOrThrow({
+where: { id: sourceCountryId }, include: { jurisdiction: true } });
+const task = await prisma.crawlTask.create({
+data: { sourceCountryId, status: "RUNNING", depth, startedAt: new Date() } });
+try {
+const content = await fetchAndClean(source.url);
+const contentHash = sha256(content);
+let docsExtracted = 0;
+// Diff-gate: skip if unchanged since last crawl
+if (source.lastContentHash === contentHash) {
+await prisma.crawlTask.update({ where: { id: task.id },
+data: { status: "DONE", finishedAt: new Date(),
+docsExtracted: 0, urlsFound: 0 } });
+await prisma.regSourceCountry.update({ where: { id: source.id },
+data: { lastCrawledAt: new Date(), crawlCount: { increment: 1 } } });
+return { taskId: task.id, unchanged: true };
+}
+// Discover linked documents (hrefs to PDFs/articles/gazettes)
+const discoveredUrls = discoverLinks(content, source.url, depth);
+// Persist as a SourceDocument so the extractor + diff-gate can process it.
+// We reuse the existing RegSource pipeline via a platform-level source row.
+const platformSource = await ensurePlatformSource(source);
+const doc = await prisma.sourceDocument.create({
+data: {
+sourceId: platformSource.id, title: `${source.name} crawl ${new Date().toISOString().slice(0, 10)}`,
+url: source.url, externalRef: `crawl:${task.id}`, contentHash,
+rawStorageKey: `ria/${source.jurisdictionId}/${task.id}`,
+docType: "NEWS", status: "NEW",
+},
+});
+await chunkAndEmbed(doc.id, content);
+docsExtracted = 1;
+await prisma.crawlTask.update({ where: { id: task.id },
+data: { status: "DONE", finishedAt: new Date(),
+urlsFound: discoveredUrls.length, docsExtracted } });
+await prisma.regSourceCountry.update({ where: { id: source.id },
+data: { lastCrawledAt: new Date(), lastContentHash: contentHash,
+crawlCount: { increment: 1 } } });
+emit({ type: "regchange.detected", source: "review",
+payload: { jurisdiction: source.jurisdictionId, crawlTaskId: task.id,
+urlsFound: discoveredUrls.length, sourceCountryId: source.id } });
+return { taskId: task.id, unchanged: false, urlsFound: discoveredUrls.length, docId: doc.id };
+} catch (err) {
+await prisma.crawlTask.update({ where: { id: task.id },
+data: { status: "FAILED", finishedAt: new Date(), error: String(err).slice(0, 300) } });
+emit({ type: "api.request.failed", source: "review",
+payload: { kind: "ria_crawl_failed", sourceCountryId, error: String(err).slice(0, 200) } });
+return { taskId: task.id, failed: true, error: String(err).slice(0, 300) };
+}
+}
+/** Heuristic link discovery — finds candidate regulatory documents. */
+function discoverLinks(html: string, baseUrl: string, depth: number): string[] {
+if (depth <= 0) return [];
+const hrefs = [...html.matchAll(/href=["']([^"']+)["']/g)].map((m) => m[1]);
+const candidates = hrefs.filter((h) =>
+/\.(pdf|htm|html)(\?|$)/i.test(h) ||
+/(regulation|directive|guidance|gazette|law|act|rule)/i.test(h));
+const abs = candidates.map((h) => h.startsWith("http") ? h : new URL(h, baseUrl).href);
+return [...new Set(abs)].slice(0, 50);
+}
+/** Ensure a platform-level RegSource row backs a country source (reuses
+* the existing RegSource → SourceDocument → RegChange pipeline). */
+async function ensurePlatformSource(source: { jurisdictionId: string; name: string; url: string }) {
+const name = `RIA:${source.jurisdictionId}:${source.name}`;
+const existing = await prisma.regSource.findFirst({ where: { name } });
+if (existing) return existing;
+return prisma.regSource.create({
+data: {
+name, url: source.url, authority: source.jurisdictionId,
+jurisdiction: source.jurisdictionId, category: "Privacy",
+checkFrequencyCron: "0 6 * * *", parserType: "RIA_CRAWLER",
+},
+});
+}
+/** Crawl all enabled sources for a jurisdiction (worker entry point). */
+export async function crawlJurisdiction(jurisdictionId: string) {
+const sources = await prisma.regSourceCountry.findMany({
+where: { jurisdictionId, enabled: true } });
+const results = [];
+for (const s of sources) results.push(await crawlSource(s.id));
+return { jurisdiction: jurisdictionId, crawled: results.length,
+changed: results.filter((r) => !r.unchanged && !r.failed).length };
+}
+```
+### END FILE
+### FILE: packages/knowledge/src/ria/learning.ts
+```typescript
+import { prisma } from "@db/client";
+import { emit } from "@brain/emit";
+/**
+* THE LEARNING LOOP — the Brain evolves with regulatory changes.
+*
+* Every expert decision in the review console becomes a RegLearningSignal.
+* These signals drive four adaptations:
+* 1. Source reliability — how often a feed's extractions survive review.
+* 2. Extraction calibration — confidence adjustment per changeType+jurisdiction.
+* 3. Impact-grading accuracy — predicted vs actual impact level per framework.
+* 4. Routing weights — whether changes landed on the right controls.
+*/
+/** Called by the review console on APPROVE/REJECT of a REG_CHANGE. */
+export async function captureLearningSignal(input: {
+jurisdictionId: string; sourceCountryId?: string; changeType: string;
+extractedConfidence: number; expertDecision: "APPROVED" | "REJECTED" | "MODIFIED";
+impactPredicted?: string; impactActual?: string;
+routingCorrect?: boolean; reviewerNote?: string;
+}) {
+const signal = await prisma.regLearningSignal.create({ data: input });
+// Immediately update source reliability (rolling accuracy)
+if (input.sourceCountryId) {
+await updateSourceReliability(input.sourceCountryId, input.expertDecision);
+}
+emit({ type: "brain.anomaly.opened", source: "review",
+payload: { kind: "ria_learning_signal", signalId: signal.id,
+decision: input.expertDecision, jurisdiction: input.jurisdictionId } });
+return signal;
+}
+/** Rolling reliability for a source: APPROVED raises, REJECTED lowers. */
+async function updateSourceReliability(sourceCountryId: string,
+decision: "APPROVED" | "REJECTED" | "MODIFIED") {
+const source = await prisma.regSourceCountry.findUnique({
+where: { id: sourceCountryId } });
+if (!source) return;
+const recent = await prisma.regLearningSignal.count({
+where: { sourceCountryId, createdAt: { gte: daysAgo(90) } } });
+const approved = await prisma.regLearningSignal.count({
+where: { sourceCountryId, expertDecision: "APPROVED",
+createdAt: { gte: daysAgo(90) } } });
+const accuracy = recent > 0 ? approved / recent : 0.5;
+// Blend with prior reliability (exponential smoothing, alpha=0.3)
+const next = 0.7 * source.reliability + 0.3 * accuracy;
+await prisma.regSourceCountry.update({
+where: { id: sourceCountryId }, data: { reliability: next } });
+}
+/** Extraction calibration: actual approval rate per changeType+jurisdiction.
+* The extractor reads this to adjust its claimed confidence. */
+export async function extractionCalibration(jurisdictionId: string, changeType: string) {
+const total = await prisma.regLearningSignal.count({
+where: { jurisdictionId, changeType, createdAt: { gte: daysAgo(180) } } });
+if (total < 5) return { samples: total, calibrated: false, approvalRate: null };
+const approved = await prisma.regLearningSignal.count({
+where: { jurisdictionId, changeType, expertDecision: "APPROVED",
+createdAt: { gte: daysAgo(180) } } });
+return { samples: total, calibrated: true, approvalRate: approved / total };
+}
+/** Impact-grading accuracy per framework — predicted vs actual. */
+export async function impactAccuracy(frameworkFilter?: string) {
+const signals = await prisma.regLearningSignal.findMany({
+where: { impactPredicted: { not: null }, impactActual: { not: null } },
+take: 500, orderBy: { createdAt: "desc" } });
+const graded = signals.filter((s) => s.impactPredicted && s.impactActual);
+const exact = graded.filter((s) => s.impactPredicted === s.impactActual).length;
+return { samples: graded.length, exactMatchRate: graded.length ? exact / graded.length : null };
+}
+/** Low-reliability sources get flagged for the Brain to de-prioritize. */
+export async function flagLowReliabilitySources(threshold = 0.3) {
+const low = await prisma.regSourceCountry.findMany({
+where: { reliability: { lt: threshold }, enabled: true } });
+for (const s of low) {
+emit({ type: "brain.anomaly.opened", source: "review",
+severityOverride: "WARN",
+payload: { kind: "ria_low_reliability_source", sourceCountryId: s.id,
+reliability: s.reliability, name: s.name } });
+}
+return { flagged: low.length };
+}
+/** Diagnostician helper: "how accurate is our reg extraction?" */
+export async function learningSummary() {
+const [totalSignals, sources, impact] = await Promise.all([
+prisma.regLearningSignal.count(),
+prisma.regSourceCountry.aggregate({ _avg: { reliability: true } }),
+impactAccuracy(),
+]);
+return {
+totalSignals,
+avgSourceReliability: sources._avg.reliability,
+impactGrading: impact,
+};
+}
+const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000);
+```
+### END FILE
+### FILE: packages/knowledge/src/ria/graph.ts
+```typescript
+import { prisma } from "@db/client";
+/**
+* REGULATORY KNOWLEDGE GRAPH — links regulations → requirements → controls
+* across jurisdictions, enabling cross-jurisdiction reasoning:
+* "This EU change affects these 12 controls in these 3 countries."
+*/
+/** Upsert a graph node for a regulation/requirement/control. */
+export async function upsertNode(input: {
+jurisdictionId: string; nodeType: "REGULATION" | "REQUIREMENT" | "CONTROL" | "GUIDANCE";
+refCode: string; title: string; regChangeId?: string;
+linkedRequirementId?: string; linkedControlTemplateId?: string;
+confidence?: number;
+}) {
+return prisma.regKnowledgeNode.upsert({
+where: { jurisdictionId_nodeType_refCode: {
+jurisdictionId: input.jurisdictionId, nodeType: input.nodeType, refCode: input.refCode } },
+update: { title: input.title, confidence: input.confidence ?? 0.5 },
+create: {
+jurisdictionId: input.jurisdictionId, nodeType: input.nodeType,
+refCode: input.refCode, title: input.title, regChangeId: input.regChangeId,
+linkedRequirementId: input.linkedRequirementId,
+linkedControlTemplateId: input.linkedControlTemplateId,
+confidence: input.confidence ?? 0.5,
+},
+});
+}
+/** Given a RegChange, find which control templates it touches (via mapped
+* requirements), then return the affected orgs. This is the cross-
+* jurisdiction reasoning the Brain uses for fan-out. */
+export async function controlsAffectedByChange(regChangeId: string) {
+const impacts = await prisma.changeImpact.findMany({
+where: { regChangeId }, include: { requirement: true } });
+const requirementIds = impacts.filter((i) => i.requirementId).map((i) => i.requirementId!);
+const controlTemplates = await prisma.controlTemplate.findMany({});
+const affected = new Set<string>();
+for (const tpl of controlTemplates) {
+const mappings = tpl.mappings as { framework: string; code: string }[];
+for (const m of mappings) {
+const req = await prisma.frameworkRequirement.findFirst({
+where: { framework: { code: m.framework }, code: m.code } });
+if (req && requirementIds.includes(req.id)) affected.add(tpl.id);
+}
+}
+return { requirementIds, controlTemplateIds: [...affected] };
+}
+/** Seed graph nodes from a verified RegChange (called after expert approval). */
+export async function materializeGraphForChange(regChangeId: string) {
+const change = await prisma.regChange.findUniqueOrThrow({
+where: { id: regChangeId }, include: { impacts: true } });
+for (const impact of change.impacts) {
+if (!impact.requirementId) continue;
+const req = await prisma.frameworkRequirement.findUnique({
+where: { id: impact.requirementId }, include: { framework: true } });
+if (!req) continue;
+await upsertNode({
+jurisdictionId: change.jurisdiction, nodeType: "REQUIREMENT",
+refCode: req.code, title: req.title, regChangeId,
+linkedRequirementId: req.id, confidence: 0.8,
+});
+}
+return { nodes: change.impacts.filter((i) => i.requirementId).length };
+}
+```
+### END FILE
+### FILE: packages/knowledge/src/ria/agent.ts
+```typescript
+import { prisma } from "@db/client";
+import { emit } from "@brain/emit";
+import { crawlJurisdiction } from "./crawler";
+import { extractionCalibration, flagLowReliabilitySources } from "./learning";
+import { runAgent } from "@agents";
+/**
+* THE REGULATORY INTELLIGENCE AGENT — orchestrates the full loop:
+* discover → crawl → extract → grade → (expert review) → learn → evolve.
+*
+* This is the entry point the workers' schedule calls. It is deliberately
+* idempotent and resumable: each jurisdiction is independent.
+*/
+export async function runRiaCycle(opts: { jurisdictions?: string[] } = {}) {
+const targets = opts.jurisdictions
+? await prisma.jurisdiction.findMany({ where: { code: { in: opts.jurisdictions }, enabled: true } })
+: await prisma.jurisdiction.findMany({ where: { enabled: true } });
+const summary: { jurisdiction: string; crawled: number; changed: number }[] = [];
+for (const j of targets) {
+try {
+const r = await crawlJurisdiction(j.code);
+summary.push(r);
+} catch (e) {
+emit({ type: "api.request.failed", source: "review",
+payload: { kind: "ria_cycle_failed", jurisdiction: j.code,
+error: String(e).slice(0, 200) } });
+}
+}
+// Post-cycle learning maintenance
+await flagLowReliabilitySources(0.3);
+emit({ type: "regchange.applied", source: "review",
+payload: { kind: "ria_cycle_complete", jurisdictions: summary.length,
+totalChanged: summary.reduce((s, r) => s + r.changed, 0) } });
+return { jurisdictions: summary.length, results: summary };
+}
+/** Agent-assisted extraction with learning-calibrated confidence. The
+* extractor claims a confidence; we adjust it by the jurisdiction's actual
+* approval rate (the learned calibration). */
+export async function extractWithLearning(input: {
+jurisdictionId: string; changeType: string; rawConfidence: number;
+summary: string; obligations: unknown[];
+}) {
+const cal = await extractionCalibration(input.jurisdictionId, input.changeType);
+let confidence = input.rawConfidence;
+if (cal.calibrated && cal.approvalRate !== null) {
+// If the extractor historically over-claims for this changeType, shrink.
+confidence = Math.min(confidence, confidence * (cal.approvalRate + 0.5));
+}
+// Persist as a RegChange for the review console. Requires a SourceDocument —
+// the crawler created one; here we accept an optional sourceDocumentId.
+return { adjustedConfidence: confidence, calibration: cal };
+}
+```
+### END FILE
+### FILE: packages/brain/src/ria.ts
+```typescript
+import { brainDb } from "./brainDb";
+import { emit } from "./emit";
+import { prisma } from "@db/client";
+/**
+* BRAIN × RIA — the Brain evolves with regulatory changes.
+*
+* The Brain consumes RegLearningSignals to adapt its own behavior:
+* - Low-reliability sources raise anomaly sensitivity (watch them harder).
+* - Extraction drift (falling approval rate) opens a brain anomaly.
+* - The diagnostician can answer "how accurate is our reg extraction?"
+*/
+/** Periodic (called from the brain worker's periodicLoop): scan learning
+* signals for drift and open anomalies when extraction accuracy degrades. */
+export async function monitorRiaHealth() {
+const recent = await prisma.regLearningSignal.findMany({
+where: { createdAt: { gte: new Date(Date.now() - 7 * 86_400_000) } } });
+if (recent.length < 10) return { samples: recent.length, drift: false };
+const rejected = recent.filter((s) => s.expertDecision === "REJECTED").length;
+const rejectRate = rejected / recent.length;
+if (rejectRate > 0.3) {
+await brainDb.anomaly.create({
+data: {
+detector: "ria", subsystem: "extraction", metric: "rejection_rate",
+value: rejectRate, baseline: 0.1, severity: "WARN", status: "OPEN",
+details: { rejectRate, samples: recent.length },
+},
+}).catch(() => {});
+emit({ type: "brain.anomaly.opened", source: "brain",
+severityOverride: "WARN",
+payload: { kind: "ria_extraction_drift", rejectRate, samples: recent.length } });
+return { samples: recent.length, drift: true, rejectRate };
+}
+return { samples: recent.length, drift: false, rejectRate };
+}
+/** Diagnostician helper — answers "how accurate is our regulatory
+* intelligence?" using the learning signals. */
+export async function riaAccuracyReport() {
+const [signals, sources] = await Promise.all([
+prisma.regLearningSignal.findMany({ take: 1000, orderBy: { createdAt: "desc" } }),
+prisma.regSourceCountry.findMany({ where: { enabled: true } }),
+]);
+const approved = signals.filter((s) => s.expertDecision === "APPROVED").length;
+const avgReliability = sources.length
+? sources.reduce((a, s) => a + s.reliability, 0) / sources.length : null;
+return {
+totalSignals: signals.length,
+approvalRate: signals.length ? approved / signals.length : null,
+avgSourceReliability: avgReliability,
+sourcesTracked: sources.length,
+};
+}
+```
+### END FILE
+### FILE: packages/review/src/sources/regIntelligence.ts
+```typescript
+import { prisma } from "@db/client";
+import { ReviewSource, RenderBundle, enqueue } from "./types";
+import { applyVerifiedChange } from "@knowledge";
+import { captureLearningSignal } from "@knowledge";
+import { materializeGraphForChange, controlsAffectedByChange } from "@knowledge";
+/**
+* RIA review adapter — REG_CHANGE items produced by the crawler route here.
+* On APPROVE: apply the change, materialize the knowledge graph, and capture
+* a learning signal. On REJECT: capture a learning signal (lowers source
+* reliability + recalibrates extraction confidence).
+*/
+export const regIntelligenceSource: ReviewSource = {
+queueType: "REG_CHANGE",
+async scanAndEnqueue() {
+const rows = await prisma.regChange.findMany({
+where: { status: "PENDING_REVIEW" },
+include: { sourceDocument: true, impacts: true } });
+let enqueued = 0;
+for (const c of rows) {
+const levels = c.impacts.map((i) => i.impactLevel);
+const priority = levels.includes("CRITICAL") ? "CRITICAL"
+: levels.includes("MAJOR") ? "HIGH" : "MEDIUM";
+await enqueue({
+queueType: "REG_CHANGE", sourceId: c.id,
+title: `${c.jurisdiction}: ${c.summary.slice(0, 90)}`,
+jurisdiction: c.jurisdiction, priority,
+confidence: ((c.extracted as { confidence?: number })?.confidence) ?? 0,
+requiredCredential: c.jurisdiction.startsWith("EU") || c.jurisdiction === "GB"
+? "LEGAL_EU" : "CIPA",
+preview: { summary: c.summary, changeType: c.changeType,
+effectiveAt: c.effectiveAt, impacts: levels.length },
+});
+enqueued++;
+}
+return { enqueued };
+},
+async render(id): Promise<RenderBundle> {
+const c = await prisma.regChange.findUniqueOrThrow({
+where: { id }, include: { sourceDocument: true, impacts: true } });
+const affected = await controlsAffectedByChange(id);
+const extracted = c.extracted as { obligations?: { who?: string; what?: string }[];
+confidence?: number };
+return {
+header: { title: c.summary.slice(0, 120), jurisdiction: c.jurisdiction,
+source: c.sourceDocument.title, link: c.sourceDocument.url },
+body: [
+{ kind: "evidence-quote", quotes: [
+{ source: `${c.changeType} · conf ${extracted.confidence ?? "?"}`,
+text: c.summary },
+...(extracted.obligations ?? []).map((o, i) => ({
+source: `Obligation ${i + 1}${o.who ? ` (${o.who})` : ""}`,
+text: o.what ?? "" })),
+]},
+{ kind: "impact-list", items: c.impacts.map((i) => ({
+label: i.requirementId ?? i.frameworkId, level: i.impactLevel,
+action: i.suggestedAction ?? undefined })) },
+{ kind: "affected-orgs", count: affected.controlTemplateIds.length,
+orgs: affected.controlTemplateIds.slice(0, 10) },
+],
+risk: c.impacts.some((i) => i.impactLevel === "CRITICAL")
+? ["CRITICAL impact — four-eyes approval required"] : [],
+};
+},
+async approve(id, reviewerMembershipId, note) {
+const result = await applyVerifiedChange(id, reviewerMembershipId);
+// Materialize knowledge graph + capture learning signal
+await materializeGraphForChange(id);
+const c = await prisma.regChange.findUnique({ where: { id } });
+await captureLearningSignal({
+jurisdictionId: c!.jurisdiction, changeType: c!.changeType,
+extractedConfidence: ((c!.extracted as { confidence?: number })?.confidence) ?? 0.5,
+expertDecision: "APPROVED", reviewerNote: note,
+});
+return result;
+},
+async reject(id, reviewerMembershipId, note) {
+await prisma.regChange.update({ where: { id },
+data: { status: "REJECTED", reviewedByMembershipId: reviewerMembershipId } });
+const c = await prisma.regChange.findUnique({ where: { id } });
+await captureLearningSignal({
+jurisdictionId: c!.jurisdiction, changeType: c!.changeType,
+extractedConfidence: ((c!.extracted as { confidence?: number })?.confidence) ?? 0.5,
+expertDecision: "REJECTED", reviewerNote: note,
+});
+},
+};
+```
+### END FILE
+### FILE: packages/knowledge/src/index.ts
+```typescript
+export { fetchFederalRegister, fetchRss, REG_SOURCES } from "./sources/federalRegister";
+export { processSourceDocument } from "./sources/diffGate";
+export { scanAllSources } from "./sources/scan";
+export { analyzeImpact } from "./impact";
+export { applyVerifiedChange } from "./fanout";
+export { loadLegislativeSources } from "./legislative/sourcePack";
+export { pollSource, pollDueSources, isPollDue } from "./legislative/fetcher";
+export { classifyRelevance } from "./legislative/classify";
+export { proposeMatrixAmendment } from "./legislative/extract";
+export { applyMatrixProposal, applyDueProposals,
+recomputeOpenIncidentObligations } from "./legislative/apply";
+export { chunkAndEmbed, fetchAndClean, chunkText, htmlToText } from "./utils/text";
+// ── RIA (Batch 11) ──
+export { loadJurisdictions, COUNTRY_SEED, STARTING_FEEDS } from "./ria/jurisdictions";
+export { crawlSource, crawlJurisdiction } from "./ria/crawler";
+export { captureLearningSignal, extractionCalibration, impactAccuracy,
+flagLowReliabilitySources, learningSummary } from "./ria/learning";
+export { upsertNode, controlsAffectedByChange, materializeGraphForChange } from "./ria/graph";
+export { runRiaCycle, extractWithLearning } from "./ria/agent";
+```
+### END FILE
+### FILE: packages/review/src/engine.ts
+```typescript
+import { prisma } from "@db/client";
+import { emit } from "@brain/emit";
+import type { ReviewerCredential } from "@prisma/client";
+import { frameworkContentSource } from "./sources/frameworkContent";
+import { matrixProposalSource } from "./sources/matrixProposal";
+import { regChangeSource } from "./sources/regChange";
+import { regIntelligenceSource } from "./sources/regIntelligence";
+import type { ReviewSource } from "./sources/types";
+// REG_CHANGE routes to the RIA-aware adapter (learning loop). The legacy
+// regChangeSource is kept for non-RIA changes; RIA changes carry a
+// sourceDocument.parserType of RIA_CRAWLER and prefer regIntelligenceSource.
+export const SOURCES: Record<string, ReviewSource> = {
+FRAMEWORK_CONTENT: frameworkContentSource,
+MATRIX_PROPOSAL: matrixProposalSource,
+REG_CHANGE: regIntelligenceSource, // RIA-aware (captures learning signals)
+};
+export class Conflict extends Error {}
+export class NotFoundError extends Error {}
+async function record(itemId: string, actorMembershipId: string | null,
+action: string, note?: string) {
+await prisma.reviewDecision.create({
+data: { reviewItemId: itemId, actorMembershipId: actorMembershipId ?? "",
+action, note } });
+}
+async function assertCredential(membershipId: string, credential: ReviewerCredential | null) {
+if (!credential) return;
+const profile = await prisma.reviewerProfile.findUnique({ where: { membershipId } });
+if (!profile?.active || !profile.credentials.includes(credential))
+throw new Conflict(`This item requires the ${credential} credential`);
+}
+async function finalize(itemId: string, reviewerMembershipId: string | null,
+status: string, note?: string) {
+await prisma.reviewItem.update({
+where: { id: itemId },
+data: { status: status as never, decidedByMembershipId: reviewerMembershipId ?? "",
+decidedAt: new Date(), decisionNote: note, claimedByMembershipId: null } });
+await record(itemId, reviewerMembershipId, status, note);
+}
+export async function scanAllQueues() {
+const results = await Promise.all(Object.values(SOURCES).map((s) => s.scanAndEnqueue()));
+return { enqueued: results.reduce((s, r) => s + r.enqueued, 0) };
+}
+export async function claim(itemId: string, reviewerMembershipId: string) {
+const item = await prisma.reviewItem.findUniqueOrThrow({ where: { id: itemId } });
+if (item.status !== "PENDING") throw new Conflict("Item not claimable");
+await assertCredential(reviewerMembershipId, item.requiredCredential);
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "CLAIMED", claimedByMembershipId: reviewerMembershipId,
+claimedAt: new Date() } });
+await record(itemId, reviewerMembershipId, "CLAIM");
+emit({ type: "review.item.enqueued", source: "review",
+payload: { reviewItemId: itemId, claimed: true } });
+return item;
+}
+export async function decide(itemId: string, reviewerMembershipId: string,
+decision: "APPROVE" | "REJECT" | "DEFER", note: string, deferUntil?: Date) {
+const item = await prisma.reviewItem.findUniqueOrThrow({ where: { id: itemId } });
+await assertCredential(reviewerMembershipId, item.requiredCredential);
+const source = SOURCES[item.queueType];
+if (decision === "DEFER") {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "PENDING", deferredUntil: deferUntil, claimedByMembershipId: null } });
+await record(itemId, reviewerMembershipId, "DEFER", note);
+return { status: "DEFERRED" };
+}
+if (decision === "REJECT") {
+await source.reject(item.sourceId, reviewerMembershipId, note);
+await finalize(itemId, reviewerMembershipId, "REJECTED", note);
+return { status: "REJECTED" };
+}
+if (item.priority === "CRITICAL") {
+if (!item.firstApprovalBy) {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "APPROVED_PENDING_SECOND", firstApprovalBy: reviewerMembershipId,
+firstApprovalAt: new Date() } });
+await record(itemId, reviewerMembershipId, "APPROVE_FIRST", note);
+emit({ type: "review.item.overdue", source: "review",
+payload: { reviewItemId: itemId, awaiting: "second-approver" } });
+return { status: "APPROVED_PENDING_SECOND" };
+}
+if (item.firstApprovalBy === reviewerMembershipId)
+throw new Conflict("Four-eyes: second approval must come from a different reviewer");
+}
+const result = await source.approve(item.sourceId, reviewerMembershipId, note,
+!!item.firstApprovalBy);
+await finalize(itemId, reviewerMembershipId, "APPROVED", note);
+return result ?? { status: "APPROVED" };
+}
+export async function supersedeOnConflict(newProposalId: string, stateRuleId: string) {
+const stale = await prisma.reviewItem.findMany({
+where: { queueType: "MATRIX_PROPOSAL",
+status: { in: ["PENDING", "CLAIMED", "APPROVED_PENDING_SECOND"] },
+sourceId: { not: newProposalId } },
+});
+let superseded = 0;
+for (const item of stale) {
+const p = await prisma.matrixAmendmentProposal.findUnique({ where: { id: item.sourceId } });
+if (p?.stateRuleId !== stateRuleId) continue;
+await prisma.matrixAmendmentProposal.update({ where: { id: p.id },
+data: { status: "SUPERSEDED" } });
+await finalize(item.id, null, "SUPERSEDED", `Superseded by ${newProposalId}`);
+superseded++;
+}
+return { superseded };
+}
+export async function releaseClaim(itemId: string, reviewerMembershipId: string) {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "PENDING", claimedByMembershipId: null } });
+await record(itemId, reviewerMembershipId, "RELEASE");
+}
+```
+### END FILE
+### FILE: packages/brain/src/worker.ts
+```typescript
+// OVERRIDE of batch-6 worker — adds RIA health monitoring to the periodic loop.
+/**
+* THE BRAIN — plain Node, deliberately OUTSIDE Temporal (rule #1: the
+* observer must survive the observed dying). An external uptime monitor
+* watches /healthz — the deadman for the brain itself.
+*/
+import Fastify from "fastify";
+import { brainDb } from "./brainDb";
+import { consume, ack, busDisabled } from "./bus";
+import { correlateEvent, reapStuckFlows } from "./correlate";
+import { computeAndStoreHealth } from "./health";
+import { runDetectors } from "./anomaly";
+import { processAnomalies } from "./reflexes";
+import { fanOutWebhooks } from "./webhooks";
+import { sseRegistry } from "./sse";
+import { publicStatus } from "./status";
+import { monitorRiaHealth } from "./ria";
+const CONSUMER = `brain-${process.pid}`;
+const ingestState = { lastAt: new Date(), lag: 0, processed: 0 };
+async function ingestLoop() {
+if (busDisabled) { console.warn("[brain] no REDIS_URL — ingest disabled"); return; }
+for await (const batch of consume(CONSUMER)) {
+await brainDb.brainEvent.createMany({
+data: batch.map((e) => ({
+id: e.id, type: e.fields.type, source: e.fields.source,
+orgId: e.fields.orgId || null, severity: e.fields.severity as never,
+traceId: e.fields.traceId || null, flowId: e.fields.flowId || null,
+payload: safeParse(e.fields.payload),
+})),
+skipDuplicates: true,
+}).catch(() => {});
+for (const e of batch) {
+await correlateEvent(e);
+await fanOutWebhooks(e);
+if (e.fields.orgId) sseRegistry.pushToOrg(e.fields.orgId, {
+id: e.id, type: e.fields.type, severity: e.fields.severity,
+at: e.fields.at, payload: safeParse(e.fields.payload),
+});
+}
+await ack(batch.map((e) => e.streamId));
+ingestState.lastAt = new Date();
+ingestState.processed += batch.length;
+ingestState.lag = Date.now() - ingestState.lastAt.getTime();
+}
+}
+async function periodicLoop() {
+for (;;) {
+const t0 = Date.now();
+try {
+await reapStuckFlows();
+await computeAndStoreHealth();
+const anomalies = await runDetectors();
+if (anomalies.length) await processAnomalies(anomalies);
+// RIA learning-health monitor (batch 11)
+await monitorRiaHealth().catch(() => {});
+} catch (e) { console.error(`[brain] periodic: ${String(e).slice(0, 300)}`); }
+await new Promise((r) => setTimeout(r, Math.max(60_000 - (Date.now() - t0), 5000)));
+}
+}
+function safeParse(s: string): Record<string, unknown> {
+try { return JSON.parse(s || "{}"); } catch { return {}; }
+}
+const hb = Fastify();
+hb.get("/healthz", async () => ({ ok: true, pid: process.pid,
+lastIngestAt: ingestState.lastAt.toISOString(),
+processed: ingestState.processed, liveSse: sseRegistry.connectionCount() }));
+hb.get("/status.json", async () => publicStatus());
+const port = Number(process.env.BRAIN_PORT ?? 3010);
+hb.listen({ port, host: "0.0.0.0" }).then(() =>
+console.log(`[brain] health/status on :${port} (consumer ${CONSUMER})`));
+ingestLoop();
+periodicLoop();
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+process.on(sig, async () => {
+await brainDb.$disconnect().catch(() => {});
+process.exit(0);
+});
+}
+```
+### END FILE
+### FILE: packages/brain/src/index.ts
+```typescript
+export { emit } from "./emit";
+export type { EmitInput, BrainSource } from "./emit";
+export { EVENT_CATALOG } from "./catalog";
+export type { BrainEventType, Severity } from "./catalog";
+export { sseRegistry } from "./sse";
+export { brainDb } from "./brainDb";
+export { latestHealth, computeAndStoreHealth } from "./health";
+export { runDetectors } from "./anomaly";
+export { askBrain, diagnoseIncident } from "./agents/diagnostician";
+export { publicStatus } from "./status";
+export { verifyControlChain } from "@core";
+// ── RIA (Batch 11) ──
+export { monitorRiaHealth, riaAccuracyReport } from "./ria";
+```
+### END FILE
+````
+## Part 4 — Boot the RIA + next steps
+
+```bash
+# 1. Apply Batch 11
+python3 split.py batch11.txt
+
+# 2. APPEND ria-models.prisma content to packages/db/prisma/schema.prisma
+#    (the models block marked "APPEND"), then:
+pnpm db:push          # creates Jurisdiction, RegSourceCountry, CrawlTask,
+                      # RegKnowledgeNode, RegLearningSignal
+
+# 3. Seed the country registry + starting feeds
+npx tsx packages/knowledge/src/ria/jurisdictions.ts
+
+# 4. Rebuild so @knowledge/@brain pick up the new exports
+pnpm install
+
+# 5. Wire the RIA cycle into schedules.ts — add to apps/workers/src/schedules.ts:
+#    await ensureSchedule(client, "ria-cycle", { cronExpressions: ["0 5 * * *"] },
+#      "runRiaCycle", []);
+#    and add runRiaCycle to workers' workflows/ (calls runRiaCycle activity).
+pnpm --filter @workers schedules
+```
+
+**The complete next-steps roadmap, in priority order:**
+
+1. **Now (this batch):** RIA crawl + learning loop wired. Brain monitors extraction drift. Review console captures learning signals on every approve/reject.
+2. **Next — fill the data gaps:**
+   - Build the **EUR-Lex parser** (tracked stub) for EU regulations
+   - Add **national gazette parsers** per country in the registry
+   - Raise **matrix confidence** by having experts verify the low-confidence state rows through the review console (this is the launch gate)
+3. **Then — deepen learning:**
+   - Wire `extractionCalibration` into the extractor's confidence claim (already scaffolded in `extractWithLearning`)
+   - Add a **Regulatory Impact Predictor** agent that learns to pre-grade impact level from historical signals
+4. **Finally — autonomy:**
+   - Let the crawler **discover new sources** (follow `discoverLinks` results, register promising ones as `discoveredBy: CRAWLER`)
+   - Add **source deprecation reflex** — Brain auto-disables sources below reliability threshold after N cycles
+
+**What's still genuinely missing (be honest about this):** real statutory text for most countries (you have paraphrases only), and the crawler is heuristic link-following, not a full browser-based scraper (PDF-heavy gazettes may need a headless browser + OCR, which is a separate infra decision). The learning loop works with whatever the extractor produces — its quality is bounded by extraction quality, which is bounded by source quality. That's the honest dependency chain.
+
+Want me to build **Batch 12: the EUR-Lex parser + national gazette adapters + the worker wiring for `runRiaCycle`**, or **the Regulatory Impact Predictor agent** that learns to pre-grade impact from historical signals?

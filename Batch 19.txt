@@ -1,0 +1,641 @@
+### FILE: apps/api/src/handlers/ria.ts
+```typescript
+import { FastifyInstance } from "fastify";
+import { prisma } from "@db/client";
+import { brainDb } from "@brain";
+/** RIA read-model for the /ria dashboard. Defensive: returns [] if the RIA
+* tables aren't present yet, so the screen degrades instead of 500ing. */
+async function safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
+try { return await fn(); } catch { return fallback; }
+}
+export async function riaHandlers(app: FastifyInstance) {
+app.get("/v1/ria/jurisdictions", async () =>
+safe(() => prisma.jurisdiction.findMany({ orderBy: { code: "asc" } }), [] as any[]));
+app.get("/v1/ria/sources", async () => {
+const [sources, jurisdictions] = await Promise.all([
+safe(() => prisma.regSourceCountry.findMany({ orderBy: { reliability: "desc" } }), [] as any[]),
+safe(() => prisma.jurisdiction.findMany(), [] as any[]),
+]);
+const byId = new Map(jurisdictions.map((j: any) => [j.id, j.code]));
+return sources.map((s: any) => ({
+id: s.id, name: s.name, url: s.url, parserType: s.parserType,
+jurisdictionCode: byId.get(s.jurisdictionId) ?? null,
+reliability: s.reliability ?? 0.5, status: s.status,
+lastCheckedAt: s.lastCheckedAt, docsExtracted: s.docsExtracted ?? 0,
+crawlCount: s.crawlCount ?? 0, discoveredBy: s.discoveredBy,
+}));
+});
+app.get("/v1/ria/graph", async (req) => {
+const { jurisdiction } = req.query as { jurisdiction?: string };
+const nodes = await safe(() => prisma.regKnowledgeNode.findMany({
+where: jurisdiction ? { jurisdictionId: jurisdiction } : {},
+orderBy: { confidence: "desc" }, take: 500 }), [] as any[]);
+const jurisdictions = await safe(() => prisma.jurisdiction.findMany(), [] as any[]);
+const byId = new Map(jurisdictions.map((j: any) => [j.id, j.code]));
+const counts: Record<string, number> = { REGULATION: 0, REQUIREMENT: 0, CONTROL: 0, GUIDANCE: 0 };
+for (const n of nodes) if (counts[n.nodeType] !== undefined) counts[n.nodeType]++;
+return { counts, nodes: nodes.map((n: any) => ({
+id: n.id, nodeType: n.nodeType, refCode: n.refCode, title: n.title,
+jurisdictionCode: byId.get(n.jurisdictionId) ?? null,
+confidence: n.confidence, verified: n.verified,
+linkedRequirementId: n.linkedRequirementId, linkedControlTemplateId: n.linkedControlTemplateId })) };
+});
+app.get("/v1/ria/drift", async () =>
+safe(() => brainDb.anomaly.findMany({
+where: { detector: "ria-drift", status: { in: ["OPEN", "ACKNOWLEDGED"] } },
+orderBy: { at: "desc" }, take: 50 }), [] as any[]));
+}
+```
+### END FILE
+### FILE: packages/review/src/sources/riaDrift.ts
+```typescript
+import { brainDb } from "@brain";
+import { calibrate } from "@questionnaire";
+import { ReviewSource, RenderBundle, enqueue } from "./types";
+function credentialFor(jurisdiction: string | null): string {
+if (!jurisdiction) return "CIPA";
+if (jurisdiction === "EU" || jurisdiction.startsWith("EU-") || jurisdiction === "GB") return "LEGAL_EU";
+if (jurisdiction.startsWith("US")) return "LEGAL_US_STATES";
+return "CIPA";
+}
+/** RIA_DRIFT queue: extraction-quality drift anomalies surfaced for expert
+* adjudication. Approve → recalibrate retrieval + resolve. Reject → mark
+* FALSE_POSITIVE so the detector won't re-fire. */
+export const riaDriftSource: ReviewSource = {
+queueType: "RIA_DRIFT" as never,
+async scanAndEnqueue() {
+const open = await brainDb.anomaly.findMany({
+where: { detector: "ria-drift", status: "OPEN" } });
+let enqueued = 0;
+for (const a of open) {
+const d = (a.details ?? {}) as { jurisdiction?: string };
+await enqueue({
+queueType: "RIA_DRIFT" as never, sourceId: a.id,
+title: `RIA drift: ${a.subsystem}/${a.metric} = ${a.value} (baseline ${a.baseline})`,
+jurisdiction: d.jurisdiction ?? null,
+priority: a.severity === "CRITICAL" ? "CRITICAL" : "HIGH",
+confidence: 1, requiredCredential: credentialFor(d.jurisdiction ?? null),
+preview: { metric: a.metric, value: a.value, baseline: a.baseline,
+subsystem: a.subsystem, jurisdiction: d.jurisdiction ?? null },
+});
+enqueued++;
+}
+return { enqueued };
+},
+async render(id): Promise<RenderBundle> {
+const a = await brainDb.anomaly.findUniqueOrThrow({ where: { id } });
+const d = (a.details ?? {}) as Record<string, unknown>;
+return {
+header: { title: `RIA extraction drift — ${a.subsystem}/${a.metric}`,
+jurisdiction: (d.jurisdiction as string) ?? undefined,
+source: "Brain ria-drift detector" },
+body: [
+{ kind: "evidence-quote", quotes: [{ source: "ria-drift detector",
+text: `value ${a.value} vs baseline ${a.baseline}` +
+(a.zScore != null ? ` (z=${a.zScore})` : "") }] },
+{ kind: "impact-list", items: [
+{ label: `Subsystem: ${a.subsystem}`, level: a.severity },
+{ label: "Approving recalibrates retrieval thresholds for the affected org",
+level: "INFO", action: "Recalibrate on approval" },
+{ label: "Rejecting marks the anomaly FALSE_POSITIVE", level: "INFO" },
+] },
+],
+risk: a.severity === "CRITICAL"
+? ["CRITICAL drift — auto-clone quality is degrading; adjudicate before more answers ship."] : [],
+};
+},
+async approve(id, _reviewer, _note) {
+const a = await brainDb.anomaly.findUnique({ where: { id } });
+if (a?.orgId) await calibrate(a.orgId).catch(() => {});
+await brainDb.anomaly.update({ where: { id }, data: { status: "RESOLVED" } });
+return { applied: "RIA_RECALIBRATED" };
+},
+async reject(id, _reviewer, _note) {
+await brainDb.anomaly.update({ where: { id }, data: { status: "FALSE_POSITIVE" } });
+},
+};
+```
+### END FILE
+### FILE: packages/review/src/engine.ts
+```typescript
+// OVERRIDE — registers the RIA_DRIFT source alongside the other three queues.
+import { prisma } from "@db/client";
+import { emit } from "@brain/emit";
+import type { ReviewerCredential } from "@prisma/client";
+import { frameworkContentSource } from "./sources/frameworkContent";
+import { matrixProposalSource } from "./sources/matrixProposal";
+import { regChangeSource } from "./sources/regChange";
+import { riaDriftSource } from "./sources/riaDrift";
+import type { ReviewSource } from "./sources/types";
+export const SOURCES: Record<string, ReviewSource> = {
+FRAMEWORK_CONTENT: frameworkContentSource,
+MATRIX_PROPOSAL: matrixProposalSource,
+REG_CHANGE: regChangeSource,
+RIA_DRIFT: riaDriftSource,
+};
+export class Conflict extends Error {}
+export class NotFoundError extends Error {}
+async function record(itemId: string, actorMembershipId: string | null,
+action: string, note?: string) {
+await prisma.reviewDecision.create({ data: { reviewItemId: itemId,
+actorMembershipId: actorMembershipId ?? "", action, note } });
+}
+async function assertCredential(membershipId: string, credential: ReviewerCredential | null) {
+if (!credential) return;
+const profile = await prisma.reviewerProfile.findUnique({ where: { membershipId } });
+if (!profile?.active || !profile.credentials.includes(credential))
+throw new Conflict(`This item requires the ${credential} credential`);
+}
+async function finalize(itemId: string, reviewerMembershipId: string | null,
+status: string, note?: string) {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: status as never, decidedByMembershipId: reviewerMembershipId ?? "",
+decidedAt: new Date(), decisionNote: note, claimedByMembershipId: null } });
+await record(itemId, reviewerMembershipId, status, note);
+}
+export async function scanAllQueues() {
+const results = await Promise.all(Object.values(SOURCES).map((s) => s.scanAndEnqueue()));
+return { enqueued: results.reduce((s, r) => s + r.enqueued, 0) };
+}
+export async function claim(itemId: string, reviewerMembershipId: string) {
+const item = await prisma.reviewItem.findUniqueOrThrow({ where: { id: itemId } });
+if (item.status !== "PENDING") throw new Conflict("Item not claimable");
+await assertCredential(reviewerMembershipId, item.requiredCredential);
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "CLAIMED", claimedByMembershipId: reviewerMembershipId, claimedAt: new Date() } });
+await record(itemId, reviewerMembershipId, "CLAIM");
+return item;
+}
+export async function decide(itemId: string, reviewerMembershipId: string,
+decision: "APPROVE" | "REJECT" | "DEFER", note: string, deferUntil?: Date) {
+const item = await prisma.reviewItem.findUniqueOrThrow({ where: { id: itemId } });
+await assertCredential(reviewerMembershipId, item.requiredCredential);
+const source = SOURCES[item.queueType];
+if (!source) throw new NotFoundError(`No source for queue ${item.queueType}`);
+if (decision === "DEFER") {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "PENDING", deferredUntil: deferUntil, claimedByMembershipId: null } });
+await record(itemId, reviewerMembershipId, "DEFER", note);
+return { status: "DEFERRED" };
+}
+if (decision === "REJECT") {
+await source.reject(item.sourceId, reviewerMembershipId, note);
+await finalize(itemId, reviewerMembershipId, "REJECTED", note);
+return { status: "REJECTED" };
+}
+if (item.priority === "CRITICAL") {
+if (!item.firstApprovalBy) {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "APPROVED_PENDING_SECOND", firstApprovalBy: reviewerMembershipId,
+firstApprovalAt: new Date() } });
+await record(itemId, reviewerMembershipId, "APPROVE_FIRST", note);
+return { status: "APPROVED_PENDING_SECOND" };
+}
+if (item.firstApprovalBy === reviewerMembershipId)
+throw new Conflict("Four-eyes: second approval must come from a different reviewer");
+}
+const result = await source.approve(item.sourceId, reviewerMembershipId, note, !!item.firstApprovalBy);
+await finalize(itemId, reviewerMembershipId, "APPROVED", note);
+return result ?? { status: "APPROVED" };
+}
+export async function releaseClaim(itemId: string, reviewerMembershipId: string) {
+await prisma.reviewItem.update({ where: { id: itemId },
+data: { status: "PENDING", claimedByMembershipId: null } });
+await record(itemId, reviewerMembershipId, "RELEASE");
+}
+```
+### END FILE
+### FILE: apps/api/src/index.ts
+```typescript
+// OVERRIDE (batch 19) — registers riaHandlers inside the eitherAuth plugin.
+import Fastify from "fastify";
+import cookie from "@fastify/cookie";
+import cors from "@fastify/cors";
+import { mountCatalogRoutes } from "./routes/catalogRest";
+import { brainRoutes } from "./routes/brain";
+import { brainStreamRoutes } from "./routes/brainStream";
+import { auditorRoutes, auditorGdprRoutes } from "./routes/auditor";
+import { trustRoutes } from "./routes/trust";
+import { reviewRoutes } from "./routes/review";
+import { ethicsEventsRoutes } from "./routes/ethics-events";
+import { controlHandlers } from "./handlers/controls";
+import { reviewHandlers } from "./handlers/questionnaireReview";
+import { riaHandlers } from "./handlers/ria";
+import { eitherAuth } from "./middleware/eitherAuth";
+import { emit } from "@brain/emit";
+import "@skills";
+const app = Fastify({ logger: { level: "warn" }, bodyLimit: 12 * 1024 * 1024 });
+await app.register(cookie);
+await app.register(cors, {
+origin: (origin, cb) =>
+cb(null, !origin || origin.includes(process.env.APP_DOMAIN ?? "localhost:3000")),
+credentials: true,
+});
+app.get("/healthz", async () => ({ ok: true, service: "api", at: new Date().toISOString() }));
+await app.register(async (instance) => {
+instance.addHook("preHandler", eitherAuth(null));
+await controlHandlers(instance);
+await reviewHandlers(instance);
+await riaHandlers(instance);
+});
+await app.register(mountCatalogRoutes);
+await app.register(brainRoutes);
+await app.register(brainStreamRoutes);
+await app.register(auditorRoutes);
+await app.register(auditorGdprRoutes);
+await app.register(trustRoutes);
+await app.register(reviewRoutes);
+await app.register(ethicsEventsRoutes);
+app.addHook("onError", async (req, reply, err) => {
+emit({ type: "api.request.failed", source: req.url.startsWith("/mcp") ? "mcp" : "api",
+orgId: req.org?.id, severityOverride: "WARN",
+payload: { url: req.url, status: reply.statusCode, error: String(err.message).slice(0, 200) } });
+});
+const port = Number(process.env.PORT ?? 3000);
+await app.listen({ port, host: "0.0.0.0" });
+console.log(`API on :${port}`);
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+process.on(sig, async () => { await app.close(); process.exit(0); });
+}
+```
+### END FILE
+### FILE: apps/web/src/lib/api.ts
+```typescript
+// OVERRIDE (batch 19) — adds RIA read-model + review-console methods.
+import type { ChainProof, ControlDetail, QuestionnaireReviewData, ReadinessResponse } from "./types";
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
+export class ApiError extends Error {
+constructor(public status: number, public body: unknown) { super(`API ${status}`); }
+}
+async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+const res = await fetch(`${API_BASE}${path}`, {
+method,
+headers: body ? { "content-type": "application/json" } : undefined,
+body: body ? JSON.stringify(body) : undefined,
+credentials: "include",
+});
+if (!res.ok) throw new ApiError(res.status, await res.json().catch(() => ({})));
+return (res.status === 204 ? undefined : await res.json()) as T;
+}
+export const api = {
+get: <T>(p: string) => req<T>("GET", p),
+post: <T>(p: string, b?: unknown) => req<T>("POST", p, b),
+readiness: (fw: string) => req<ReadinessResponse>("GET", `/v1/readiness/${fw}`),
+control: (slug: string) => req<ControlDetail>("GET", `/v1/controls/${slug}`),
+chainProof: (slug: string) => req<ChainProof>("GET", `/v1/controls/${slug}/chain-proof`),
+runCheck: (checkId: string) =>
+req<{ runId: string; status: string; evidenceId: string | null }>("POST", `/v1/checks/${checkId}/run`),
+tasks: () => req<{ open: number; overdue: number; byPriority: Record<string, number> }>("GET", "/v1/tasks?summary=1"),
+qualityDist: () => req<Record<string, number>>("GET", "/v1/quality/distribution"),
+regChanges: () => req<{ id: string; summary: string; effectiveAt: string | null }[]>("GET", "/v1/regulatory-changes?limit=3"),
+reviewData: (id: string) => req<QuestionnaireReviewData>("GET", `/v1/questionnaires/${id}/drafts`),
+approve: (id: string, qId: string, answer?: string) =>
+req<{ status: string }>("POST", `/v1/questionnaires/${id}/questions/${qId}/approve`, answer ? { answer } : {}),
+reject: (id: string, qId: string, code: string, note?: string) =>
+req<{ status: string }>("POST", `/v1/questionnaires/${id}/questions/${qId}/reject`, { code, note }),
+bulkApprove: (id: string, ids: string[]) =>
+req<{ approved: number }>("POST", `/v1/questionnaires/${id}/bulk-approve`, { ids }),
+// ── RIA read-model ──
+riaJurisdictions: () => req<any[]>("GET", "/v1/ria/jurisdictions"),
+riaSources: () => req<any[]>("GET", "/v1/ria/sources"),
+riaGraph: (j?: string) => req<{ counts: Record<string, number>; nodes: any[] }>("GET", `/v1/ria/graph${j ? `?jurisdiction=${j}` : ""}`),
+riaDrift: () => req<any[]>("GET", "/v1/ria/drift"),
+// ── review console (expert gate) ──
+reviewQueue: () => req<any[]>("GET", "/v1/review/queue"),
+reviewScan: () => req<{ enqueued: number }>("POST", "/v1/review/scan"),
+reviewItem: (id: string) => req<{ item: any; bundle: any }>("GET", `/v1/review/${id}`),
+reviewClaim: (id: string) => req<unknown>("POST", `/v1/review/${id}/claim`),
+reviewDecide: (id: string, decision: "APPROVE" | "REJECT" | "DEFER", note: string) =>
+req<unknown>("POST", `/v1/review/${id}/decide`, { decision, note }),
+reviewRelease: (id: string) => req<unknown>("POST", `/v1/review/${id}/release`),
+reviewStats: () => req<{ byStatus: any[]; slaBreaches: number }>("GET", "/v1/review/stats"),
+};
+```
+### END FILE
+### FILE: apps/web/src/app/ria/page.tsx
+```tsx
+import { RiaDashboard } from "../../components/RiaDashboard";
+export default function Page() { return <RiaDashboard />; }
+```
+### END FILE
+### FILE: apps/web/src/components/RiaDashboard.tsx
+```tsx
+"use client";
+import { useState } from "react";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { relTime } from "../lib/format";
+import { Badge, Card, CardTitle, Skeleton, Tabs } from "./ui";
+type Tab = "jurisdictions" | "sources" | "graph" | "drift";
+const relBar = (v: number) =>
+v >= 0.85 ? "bg-pass" : v >= 0.6 ? "bg-warn" : "bg-fail";
+export function RiaDashboard() {
+const [tab, setTab] = useState<Tab>("jurisdictions");
+const jurisdictions = useApi<any[]>("/v1/ria/jurisdictions");
+const sources = useApi<any[]>("/v1/ria/sources");
+const graph = useApi<{ counts: Record<string, number>; nodes: any[] }>("/v1/ria/graph");
+const drift = useApi<any[]>("/v1/ria/drift");
+return (
+<div className="space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Regulatory Intelligence Agent</h1>
+<span className="text-xs text-muted-foreground">crawl → extract → graph → expert review</span>
+</div>
+<Card>
+<Tabs<Tab> active={tab} onChange={setTab} tabs={[
+{ id: "jurisdictions", label: "Jurisdictions", count: jurisdictions.data?.length ?? 0 },
+{ id: "sources", label: "Source reliability", count: sources.data?.length ?? 0 },
+{ id: "graph", label: "Knowledge graph", count: graph.data?.nodes.length ?? 0 },
+{ id: "drift", label: "Extraction drift", count: drift.data?.length ?? 0 },
+]} />
+{tab === "jurisdictions" && (
+<div className="overflow-x-auto">
+<table className="w-full text-[13px]"><thead><tr className="border-b border-border text-left text-[11px] uppercase tracking-wide text-muted-foreground">
+<th className="px-4 py-2">Code</th><th className="px-2 py-2">Name</th><th className="px-2 py-2">Region</th><th className="px-2 py-2">Tradition</th><th className="px-2 py-2">Status</th></tr></thead>
+<tbody className="divide-y divide-border">
+{(jurisdictions.data ?? []).map((j) => (
+<tr key={j.id ?? j.code}><td className="px-4 py-2 font-mono text-xs">{j.code}</td>
+<td className="px-2 py-2">{j.name}</td><td className="px-2 py-2">{j.region}</td>
+<td className="px-2 py-2 text-xs text-muted-foreground">{j.legalTradition}</td>
+<td className="px-2 py-2">{j.enabled ? <Badge tone="pass">enabled</Badge> : <Badge tone="zinc">disabled</Badge>}</td></tr>
+))}
+{(jurisdictions.data ?? []).length === 0 && <tr><td colSpan={5} className="px-4 py-8 text-center text-xs text-muted-foreground">No jurisdictions loaded. Run the RIA seed.</td></tr>}
+</tbody></table>
+</div>
+)}
+{tab === "sources" && (
+<div className="divide-y divide-border">
+{(sources.data ?? []).map((s) => (
+<div key={s.id} className="flex items-center gap-3 px-4 py-3">
+<div className="min-w-0 flex-1">
+<p className="text-[13px] font-medium">{s.name}</p>
+<p className="text-xs text-muted-foreground">{s.jurisdictionCode ?? "—"} · {s.parserType} · {s.crawlCount} crawls · {s.docsExtracted} docs{s.discoveredBy === "CRAWLER" ? " · auto-discovered" : ""}</p>
+</div>
+<div className="flex items-center gap-2">
+<div className="h-1.5 w-28 rounded bg-muted"><div className={`h-1.5 rounded ${relBar(s.reliability)}`} style={{ width: `${Math.round(s.reliability * 100)}%` }} /></div>
+<span className="w-9 text-right text-xs tabular-nums text-muted-foreground">{Math.round(s.reliability * 100)}%</span>
+</div>
+<Badge tone={s.status === "ACTIVE" ? "pass" : s.status === "ERROR" ? "fail" : "zinc"}>{s.status}</Badge>
+</div>
+))}
+{(sources.data ?? []).length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No sources registered.</p>}
+</div>
+)}
+{tab === "graph" && (
+<div className="p-4">
+<div className="mb-3 flex gap-2">
+{Object.entries(graph.data?.counts ?? {}).map(([t, n]) => (
+<Badge key={t} tone={t === "REGULATION" ? "info" : t === "CONTROL" ? "pass" : "zinc"}>{t}: {n}</Badge>
+))}
+</div>
+<div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+{(graph.data?.nodes ?? []).slice(0, 60).map((n) => (
+<div key={n.id} className="rounded-md border border-border bg-white p-2.5">
+<div className="flex items-center gap-1.5">
+<Badge tone={n.nodeType === "REGULATION" ? "info" : n.nodeType === "CONTROL" ? "pass" : "zinc"}>{n.nodeType}</Badge>
+<span className="font-mono text-[11px] text-muted-foreground">{n.refCode}</span>
+{n.verified && <span className="text-pass" title="expert-verified">✓</span>}
+</div>
+<p className="mt-1 line-clamp-2 text-xs">{n.title}</p>
+<p className="mt-0.5 text-[11px] text-muted-foreground">{n.jurisdictionCode ?? "—"} · conf {Number(n.confidence).toFixed(2)}</p>
+</div>
+))}
+</div>
+{(graph.data?.nodes ?? []).length === 0 && <p className="py-8 text-center text-xs text-muted-foreground">Knowledge graph empty — run a crawl to populate it.</p>}
+</div>
+)}
+{tab === "drift" && (
+<div className="divide-y divide-border">
+{(drift.data ?? []).map((a) => (
+<div key={a.id} className="px-4 py-3">
+<div className="flex items-center gap-2">
+<Badge tone={a.severity === "CRITICAL" ? "fail" : "warn"}>{a.severity}</Badge>
+<span className="text-[13px] font-medium">{a.subsystem}</span>
+<span className="text-xs text-muted-foreground">{a.detector} · {a.metric}</span>
+<span className="ml-auto text-xs text-muted-foreground">{relTime(a.at)}</span>
+</div>
+<p className="mt-1 text-xs text-muted-foreground">value <b className="tabular-nums">{a.value}</b> vs baseline <b className="tabular-nums">{a.baseline}</b>{a.zScore != null && <> · z {a.zScore}</>}</p>
+</div>
+))}
+{(drift.data ?? []).length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No open extraction-drift anomalies. The learning loop is holding.</p>}
+</div>
+)}
+</Card>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/review/page.tsx
+```tsx
+import { ReviewConsole } from "../../components/ReviewConsole";
+export default function Page() { return <ReviewConsole />; }
+```
+### END FILE
+### FILE: apps/web/src/components/ReviewConsole.tsx
+```tsx
+"use client";
+import { useEffect, useState } from "react";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { Badge, Button, Card, Skeleton, Tabs } from "./ui";
+type Tab = "ALL" | "FRAMEWORK_CONTENT" | "MATRIX_PROPOSAL" | "REG_CHANGE" | "RIA_DRIFT";
+const Q_TONE: Record<string, "pass" | "fail" | "warn" | "info" | "zinc"> = {
+FRAMEWORK_CONTENT: "info", MATRIX_PROPOSAL: "warn", REG_CHANGE: "zinc", RIA_DRIFT: "fail" };
+export function ReviewConsole() {
+const [tab, setTab] = useState<Tab>("ALL");
+const queue = useApi<any[]>("/v1/review/queue");
+const stats = useApi<{ byStatus: any[]; slaBreaches: number }>("/v1/review/stats");
+const [selectedId, setSelectedId] = useState<string | null>(null);
+const [detail, setDetail] = useState<{ item: any; bundle: any } | null>(null);
+const [note, setNote] = useState("");
+const [busy, setBusy] = useState(false);
+const [flash, setFlash] = useState<string | null>(null);
+const say = (m: string) => { setFlash(m); setTimeout(() => setFlash(null), 3500); };
+const items = (queue.data ?? []).filter((i) => tab === "ALL" || i.queueType === tab);
+useEffect(() => {
+if (!selectedId) return;
+setDetail(null);
+api.reviewItem(selectedId).then(setDetail).catch((e) => say(`Load failed: ${e.message}`));
+}, [selectedId]);
+const act = async (decision: "APPROVE" | "REJECT" | "DEFER") => {
+if (!selectedId) return;
+setBusy(true);
+try {
+const r: any = await api.reviewDecide(selectedId, decision, note);
+say(r?.status === "APPROVED_PENDING_SECOND"
+? "First approval recorded — awaiting a second reviewer (four-eyes)."
+: `${decision === "APPROVE" ? "Approved — applied downstream" : decision === "REJECT" ? "Rejected" : "Deferred"}.`);
+setSelectedId(null); setDetail(null); setNote("");
+queue.refresh(); stats.refresh();
+} catch (e: any) { say(e.body?.title ?? e.message); }
+finally { setBusy(false); }
+};
+return (
+<div className="space-y-4">
+<div className="flex flex-wrap items-center gap-3">
+<h1 className="text-lg font-semibold">Review Console — Expert Gate</h1>
+<Badge tone="zinc">{(queue.data ?? []).length} queued</Badge>
+{(stats.data?.slaBreaches ?? 0) > 0 && <Badge tone="fail">{stats.data!.slaBreaches} SLA breaches</Badge>}
+<div className="flex-1" />
+<Button variant="outline" onClick={async () => { setBusy(true); try { const r = await api.reviewScan(); say(`Scan complete — ${r.enqueued} item(s) enqueued`); queue.refresh(); } finally { setBusy(false); } }} disabled={busy}>
+{busy ? "Scanning…" : "Scan queues"}
+</Button>
+</div>
+{flash && <div className="rounded-md border border-info/30 bg-info/5 px-3 py-2 text-xs text-info">{flash}</div>}
+<Card>
+<Tabs<Tab> active={tab} onChange={setTab} tabs={[
+{ id: "ALL", label: "All", count: queue.data?.length ?? 0 },
+{ id: "FRAMEWORK_CONTENT", label: "Framework", count: (queue.data ?? []).filter((i) => i.queueType === "FRAMEWORK_CONTENT").length },
+{ id: "MATRIX_PROPOSAL", label: "Matrix", count: (queue.data ?? []).filter((i) => i.queueType === "MATRIX_PROPOSAL").length },
+{ id: "REG_CHANGE", label: "Reg change", count: (queue.data ?? []).filter((i) => i.queueType === "REG_CHANGE").length },
+{ id: "RIA_DRIFT", label: "RIA drift", count: (queue.data ?? []).filter((i) => i.queueType === "RIA_DRIFT").length },
+]} />
+<div className="grid flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[360px_1fr]">
+<div className="max-h-[70vh] overflow-y-auto border-r border-border">
+{queue.loading ? <div className="p-4"><Skeleton /></div> : items.map((it) => (
+<button key={it.id} onClick={() => setSelectedId(it.id)}
+className={`flex w-full flex-col gap-1 border-b border-border px-3 py-2.5 text-left ${selectedId === it.id ? "bg-muted" : "hover:bg-muted/50"}`}>
+<div className="flex items-center gap-2">
+<Badge tone={Q_TONE[it.queueType] ?? "zinc"}>{it.queueType}</Badge>
+<Badge tone={it.priority === "CRITICAL" ? "fail" : it.priority === "HIGH" ? "warn" : "zinc"}>{it.priority}</Badge>
+<span className="ml-auto text-[11px] text-muted-foreground">{it.status}</span>
+</div>
+<span className="line-clamp-2 text-[13px] font-medium">{it.title}</span>
+</button>
+))}
+{items.length === 0 && !queue.loading && <p className="p-8 text-center text-xs text-muted-foreground">Queue clear for this filter.</p>}
+</div>
+<div className="max-h-[70vh] overflow-y-auto p-5">
+{!selectedId && <p className="py-10 text-center text-xs text-muted-foreground">Select an item to render its review bundle.</p>}
+{selectedId && !detail && <Skeleton className="h-64" />}
+{detail && (
+<div className="space-y-4">
+<div>
+<div className="flex items-center gap-2">
+<Badge tone={Q_TONE[detail.item.queueType] ?? "zinc"}>{detail.item.queueType}</Badge>
+{detail.item.jurisdiction && <Badge tone="info">{detail.item.jurisdiction}</Badge>}
+{detail.item.requiredCredential && <Badge tone="draft">requires {detail.item.requiredCredential}</Badge>}
+</div>
+<h2 className="mt-2 text-[15px] font-semibold leading-relaxed">{detail.bundle.header.title}</h2>
+<p className="mt-1 text-xs text-muted-foreground">Source: {detail.bundle.header.source}</p>
+</div>
+{detail.bundle.risk?.length > 0 && (
+<div className="rounded-md border border-warn/30 bg-warn/5 p-3">
+<p className="text-xs font-medium text-warn">Reviewer caution</p>
+<ul className="mt-1 list-disc pl-4 text-xs text-zinc-700">{detail.bundle.risk.map((r: string, i: number) => <li key={i}>{r}</li>)}</ul>
+</div>
+)}
+{detail.bundle.body?.map((b: any, i: number) => <BundleBlock key={i} b={b} />)}
+<textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2}
+placeholder="Decision note (recorded in the audit trail)…"
+className="w-full rounded-md border border-border p-2 text-[13px]" />
+<div className="flex flex-wrap gap-2">
+<Button variant="success" onClick={() => act("APPROVE")} disabled={busy}>Approve</Button>
+<Button variant="danger" onClick={() => act("REJECT")} disabled={busy}>Reject</Button>
+<Button variant="outline" onClick={() => act("DEFER")} disabled={busy}>Defer</Button>
+</div>
+</div>
+)}
+</div>
+</div>
+</Card>
+</div>
+);
+}
+function BundleBlock({ b }: { b: any }) {
+switch (b.kind) {
+case "diff-table":
+return (<Card><CardTitle>Proposed change (diff)</CardTitle>
+<div className="overflow-x-auto"><table className="w-full text-[13px]"><thead><tr className="border-b border-border text-left text-[11px] uppercase text-muted-foreground">
+<th className="px-3 py-2">Field</th><th className="px-3 py-2">From</th><th className="px-3 py-2">To</th><th className="px-3 py-2">Conf</th></tr></thead>
+<tbody className="divide-y divide-border">{b.rows.map((r: any, i: number) => (
+<tr key={i}><td className="px-3 py-2 font-mono text-xs">{r.field}</td>
+<td className="px-3 py-2 text-xs text-fail line-through">{r.from}</td>
+<td className="px-3 py-2 text-xs text-pass">{r.to}</td>
+<td className="px-3 py-2 text-xs tabular-nums">{r.confidence?.toFixed(2) ?? "—"}</td></tr>))}</tbody></table></div></Card>);
+case "paraphrase-card":
+return (<Card><CardTitle>Requirement paraphrase</CardTitle><div className="p-3">
+<p className="font-mono text-xs text-info">{b.requirement.code}</p>
+<p className="mt-1 text-[13px] font-medium">{b.requirement.title}</p>
+<p className="mt-1 text-xs leading-relaxed text-muted-foreground">{b.requirement.desc}</p>
+{b.officialHint && <p className="mt-2 text-[11px] text-warn">{b.officialHint}</p>}</div></Card>);
+case "impact-list":
+return (<Card><CardTitle>Impact assessment</CardTitle><div className="divide-y divide-border">
+{b.items.map((it: any, i: number) => (
+<div key={i} className="flex items-center gap-2 px-3 py-2 text-[13px]">
+<Badge tone={it.level === "CRITICAL" ? "fail" : it.level === "MAJOR" ? "warn" : "zinc"}>{it.level}</Badge>
+<span className="flex-1">{it.label}</span>{it.action && <span className="text-xs text-muted-foreground">{it.action}</span>}</div>))}</div></Card>);
+case "evidence-quote":
+return (<Card><CardTitle>Extracted evidence</CardTitle><div className="space-y-2 p-3">
+{b.quotes.map((q: any, i: number) => (
+<div key={i} className="border-l-2 border-border pl-3"><p className="text-[11px] font-medium text-muted-foreground">{q.source}</p>
+<p className="mt-0.5 text-xs leading-relaxed text-zinc-700">{q.text}</p></div>))}</div></Card>);
+case "affected-orgs":
+return (<Card><CardTitle>Blast radius</CardTitle><div className="p-3 text-[13px]">
+<p><span className="font-semibold tabular-nums">{b.count}</span> org(s) affected.</p>
+{b.orgs?.length > 0 && <p className="mt-1 font-mono text-[11px] text-muted-foreground">{b.orgs.join(", ")}</p>}</div></Card>);
+default: return null;
+}
+}
+```
+### END FILE
+### FILE: apps/web/src/components/AppShell.tsx
+```tsx
+"use client";
+// OVERRIDE (batch 19) — adds /ria and /review to the nav.
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { ReactNode } from "react";
+const NAV = [
+{ href: "/", label: "Home", icon: "▣" },
+{ href: "/controls", label: "Controls", icon: "◇" },
+{ href: "/evidence", label: "Evidence", icon: "≣" },
+{ href: "/tests", label: "Tests", icon: "⚙" },
+{ href: "/tasks", label: "Tasks", icon: "✓", badge: 7 },
+{ href: "/policies", label: "Policies", icon: "▤" },
+{ href: "/questionnaires", label: "Questionnaires", icon: "▦", badge: 32 },
+{ href: "/vendors", label: "Vendors", icon: "⌂" },
+{ href: "/privacy", label: "Privacy", icon: "⛨" },
+{ href: "/incidents", label: "Incidents", icon: "⚠" },
+{ href: "/radar", label: "Reg Radar", icon: "📡" },
+{ href: "/ria", label: "RIA", icon: "🛰" },
+{ href: "/review", label: "Review Console", icon: "🔍", badge: 4 },
+{ href: "/brain", label: "Brain", icon: "⬢" },
+];
+export function AppShell({ children }: { children: ReactNode }) {
+const path = usePathname();
+return (
+<div className="flex min-h-screen">
+<aside className="fixed inset-y-0 left-0 z-30 hidden w-[220px] flex-col border-r border-border bg-white md:flex">
+<div className="flex h-12 items-center gap-2 border-b border-border px-4 font-semibold">
+<span className="text-info">⬢</span> Compliance
+</div>
+<nav className="flex-1 space-y-0.5 overflow-y-auto p-2">
+{NAV.map((n) => {
+const active = n.href === "/" ? path === "/" : path.startsWith(n.href);
+return (
+<Link key={n.href} href={n.href}
+className={`flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px] ${active ? "bg-muted font-medium" : "text-zinc-600 hover:bg-muted/60"}`}>
+<span className="w-4 text-center text-muted-foreground">{n.icon}</span>
+<span className="flex-1">{n.label}</span>
+{n.badge !== undefined && <span className="rounded bg-zinc-900 px-1.5 text-[11px] font-medium text-white tabular-nums">{n.badge}</span>}
+</Link>
+);
+})}
+</nav>
+<div className="border-t border-border p-3 text-[11px] text-muted-foreground">⌘K to search</div>
+</aside>
+<main className="flex-1 md:pl-[220px]">
+<div className="flex h-12 items-center gap-3 border-b border-border px-6">
+<span className="text-xs text-muted-foreground">⌘K Search…</span>
+<div className="flex-1" />
+<span className="text-xs text-muted-foreground">Acme Corp</span>
+</div>
+<div className="p-6">{children}</div>
+</main>
+</div>
+);
+}
+```
+### END FILE

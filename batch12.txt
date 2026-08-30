@@ -1,0 +1,981 @@
+### FILE: apps/api/src/routes/auth.ts
+```typescript
+import { FastifyInstance } from "fastify";
+import { prisma } from "@db/client";
+import { createSession } from "../middleware/session";
+/**
+* DEV-ONLY bootstrap login. The original batches created `createSession`
+* but no route ever called it — screens could never authenticate.
+* Hard-disabled in production unless DEV_LOGIN=1 is explicitly set.
+*/
+export async function authRoutes(app: FastifyInstance) {
+app.post("/v1/auth/dev-login", async (req, reply) => {
+if (process.env.NODE_ENV === "production" && process.env.DEV_LOGIN !== "1")
+return reply.code(403).send({ title: "Disabled in production", status: 403 });
+const org = await prisma.organization.upsert({
+where: { slug: "acme" }, update: {},
+create: { name: "Acme Corp", slug: "acme", industry: "SAAS",
+employeeCount: 120, hqCountry: "US" } });
+const user = await prisma.user.upsert({
+where: { email: "sarah@acme.test" }, update: {},
+create: { email: "sarah@acme.test", name: "Sarah Chen" } });
+await prisma.membership.upsert({
+where: { userId_orgId: { userId: user.id, orgId: org.id } },
+update: {}, create: { userId: user.id, orgId: org.id, role: "OWNER" } });
+await createSession(reply,
+{ id: user.id, name: user.name, email: user.email, role: "OWNER" },
+{ id: org.id, slug: org.slug, name: org.name });
+return { ok: true, org: org.slug };
+});
+app.post("/v1/auth/logout", async (_req, reply) => {
+reply.clearCookie("cmp_session", { path: "/" });
+return { ok: true };
+});
+}
+```
+### END FILE
+### FILE: apps/api/src/handlers/onboarding.ts
+```typescript
+import { FastifyInstance } from "fastify";
+import { prisma } from "@db/client";
+import { bootstrapOrgControls, routeGdprWorkflows, storeCredentials,
+unifiedLeverage } from "@core";
+import { seedStarterChecks, onIntegrationConnected } from "@skills";
+import { startWorkflowSafe } from "../temporal";
+import type { IntegrationType } from "@prisma/client";
+interface OnboardBody {
+frameworks: string[]; industry?: string; employeeCount?: number; hqCountry?: string;
+integrations?: { type: IntegrationType; credentials: unknown; config?: object }[];
+}
+export async function onboardingHandlers(app: FastifyInstance) {
+/** The wizard's single commit: profile → controls → checks → GDPR routing
+* → integrations (sealed creds + evidence-sync workflows) → leverage. */
+app.post("/v1/onboarding", async (req, reply) => {
+const body = req.body as OnboardBody;
+const orgId = req.org!.id;
+if (!body.frameworks?.length)
+return reply.code(400).send({ title: "Select at least one framework", status: 400 });
+await prisma.organization.update({ where: { id: orgId }, data: {
+industry: body.industry, employeeCount: body.employeeCount,
+hqCountry: body.hqCountry } });
+const boot = await bootstrapOrgControls(orgId, { frameworkCodes: body.frameworks });
+const checks = await seedStarterChecks(orgId);
+const gdpr = body.frameworks.includes("GDPR")
+? await routeGdprWorkflows(orgId) : null;
+const connected: { type: string; attached: string[] }[] = [];
+for (const it of body.integrations ?? []) {
+try {
+const integrationId = await storeCredentials(orgId, it.type,
+it.credentials, it.config ?? {});
+const resolved = await onIntegrationConnected(orgId, integrationId, it.type);
+const snapshots = resolved.specs.filter((s) => s.controlId)
+.map((s) => ({ dataType: s.dataType, controlId: s.controlId!,
+title: s.title, freshnessDays: s.freshnessDays, expectStable: s.expectStable }));
+if (snapshots.length)
+await startWorkflowSafe("evidenceSyncWorkflow",
+[{ orgId, integrationId, snapshots }],
+`evidence-sync-${orgId}-${integrationId}`);
+connected.push({ type: it.type, attached: resolved.attached });
+} catch (e) {
+connected.push({ type: it.type, attached: [] }); // credential error surfaced in UI
+}
+}
+const leverage = await unifiedLeverage(orgId, body.frameworks);
+return { controls: boot.controls, checks: checks.created,
+gdprChecklistItems: gdpr?.length ?? 0, connected, leverage };
+});
+}
+```
+### END FILE
+### FILE: apps/api/src/handlers/privacy.ts
+```typescript
+import { FastifyInstance } from "fastify";
+import { prisma } from "@db/client";
+import { createPrivacyRequest, verifyPrivacyRequest, compileAccessExport,
+executeErasure, extendDsarDeadline } from "@core";
+/** PUBLIC — subject-facing intake + magic-link verification (no session). */
+export async function privacyPublicRoutes(app: FastifyInstance) {
+app.post("/v1/privacy/intake", async (req, reply) => {
+const { orgSlug, type, email, details } = req.body as {
+orgSlug: string; type: "ACCESS" | "RECTIFY" | "ERASE" | "RESTRICT" | "PORT" | "OBJECT";
+email: string; details?: string };
+const org = await prisma.organization.findUnique({ where: { slug: orgSlug } });
+if (!org || !email?.includes("@"))
+return reply.code(400).send({ title: "Invalid request", status: 400 });
+const { id } = await createPrivacyRequest(org.id, { type, email, details });
+return reply.code(201).send({ id,
+message: "Verification link sent. Deadline: 30 days (Art. 12)." });
+});
+app.post("/v1/privacy/verify", async (req) => {
+const { requestId, token } = req.body as { requestId: string; token: string };
+return { verified: await verifyPrivacyRequest(requestId, token) };
+});
+}
+/** ADMIN — inbox + actions (registered inside the eitherAuth plugin). */
+export async function privacyHandlers(app: FastifyInstance) {
+app.get("/v1/privacy-requests/:id", async (req, reply) => {
+const { id } = req.params as { id: string };
+const r = await prisma.privacyRequest.findFirst({
+where: { id, orgId: req.org!.id },
+include: { events: { orderBy: { at: "asc" } } } });
+if (!r) return reply.code(404).send({ title: "Not found", status: 404 });
+return { id: r.id, type: r.type, status: r.status,
+dueAt: r.dueAt, extensionTo: r.extensionTo,
+verifiedAt: r.verifiedAt, createdAt: r.createdAt,
+emailHash: r.emailHash.slice(0, 12) + "…", // minimization — never the email
+detailsSealed: !!r.detailsEnc,
+events: r.events.map((e) => ({ kind: e.kind, at: e.at, details: e.details })) };
+});
+app.post("/v1/privacy-requests/:id/compile", async (req, reply) => {
+const { id } = req.params as { id: string };
+const r = await prisma.privacyRequest.findFirstOrThrow({
+where: { id, orgId: req.org!.id } });
+if (!["ACCESS", "PORT"].includes(r.type))
+return reply.code(400).send({ title: "Compile applies to ACCESS/PORT only", status: 400 });
+if (r.status !== "VERIFIED")
+return reply.code(409).send({ title: `Status is ${r.status} — must be VERIFIED`, status: 409 });
+return compileAccessExport(req.org!.id, id);
+});
+app.post("/v1/privacy-requests/:id/deliver", async (req, reply) => {
+const { id } = req.params as { id: string };
+const r = await prisma.privacyRequest.findFirstOrThrow({
+where: { id, orgId: req.org!.id } });
+if (!["REVIEW", "COMPILING", "VERIFIED"].includes(r.status))
+return reply.code(409).send({ title: `Cannot deliver from ${r.status}`, status: 409 });
+await prisma.privacyRequest.update({ where: { id }, data: { status: "DELIVERED" } });
+await prisma.privacyRequestEvent.create({ data: { requestId: id, kind: "DELIVERED",
+actorMembershipId: req.user?.id } });
+return { status: "DELIVERED" };
+});
+app.post("/v1/privacy-requests/:id/erase", async (req, reply) => {
+const { id } = req.params as { id: string };
+const r = await prisma.privacyRequest.findFirstOrThrow({
+where: { id, orgId: req.org!.id } });
+if (r.type !== "ERASE")
+return reply.code(400).send({ title: "Not an erasure request", status: 400 });
+if (r.status !== "VERIFIED")
+return reply.code(409).send({ title: `Status is ${r.status} — must be VERIFIED`, status: 409 });
+const actions = await executeErasure(req.org!.id, id);
+return { status: "DELIVERED", actions };
+});
+app.post("/v1/privacy-requests/:id/extend", async (req, reply) => {
+const { id } = req.params as { id: string };
+const { reason } = (req.body ?? {}) as { reason?: string };
+const r = await prisma.privacyRequest.findFirstOrThrow({
+where: { id, orgId: req.org!.id } });
+try {
+const extensionTo = await extendDsarDeadline(id, reason ?? "Complex request",
+req.user?.id ?? "");
+return { extensionTo };
+} catch (e: any) {
+return reply.code(409).send({ title: e.message, status: 409 });
+}
+});
+}
+```
+### END FILE
+### FILE: apps/api/src/index.ts
+```typescript
+// OVERRIDE (batch 12) — batch-9 base + auth routes + onboarding/privacy handlers.
+import Fastify from "fastify";
+import cookie from "@fastify/cookie";
+import cors from "@fastify/cors";
+import { mountCatalogRoutes } from "./routes/catalogRest";
+import { brainRoutes } from "./routes/brain";
+import { brainStreamRoutes } from "./routes/brainStream";
+import { auditorRoutes, auditorGdprRoutes } from "./routes/auditor";
+import { trustRoutes } from "./routes/trust";
+import { reviewRoutes } from "./routes/review";
+import { ethicsEventsRoutes } from "./routes/ethics-events";
+import { authRoutes } from "./routes/auth";
+import { controlHandlers } from "./handlers/controls";
+import { reviewHandlers } from "./handlers/questionnaireReview";
+import { onboardingHandlers } from "./handlers/onboarding";
+import { privacyHandlers, privacyPublicRoutes } from "./handlers/privacy";
+import { eitherAuth } from "./middleware/eitherAuth";
+import { emit } from "@brain/emit";
+import "@skills";
+const app = Fastify({ logger: { level: "warn" }, bodyLimit: 12 * 1024 * 1024 });
+await app.register(cookie);
+await app.register(cors, {
+origin: (origin, cb) =>
+cb(null, !origin || origin.includes(process.env.APP_DOMAIN ?? "localhost:3000")),
+credentials: true,
+});
+app.get("/healthz", async () => ({ ok: true, service: "api", at: new Date().toISOString() }));
+// ── auth + public privacy intake (no session required) ──
+await app.register(authRoutes);
+await app.register(privacyPublicRoutes);
+// ── screen handlers: session OR API key (encapsulated guard) ─────
+await app.register(async (instance) => {
+instance.addHook("preHandler", eitherAuth(null));
+await controlHandlers(instance);
+await reviewHandlers(instance);
+await onboardingHandlers(instance);
+await privacyHandlers(instance);
+});
+// ── catalog REST (entitlement → scope → rate, per route) ─────────
+await app.register(mountCatalogRoutes);
+// ── brain (session per-route) + SSE + public status ──────────────
+await app.register(brainRoutes);
+await app.register(brainStreamRoutes);
+// ── portals & internal bridges (own auth chains) ─────────────────
+await app.register(auditorRoutes);
+await app.register(auditorGdprRoutes);
+await app.register(trustRoutes);
+await app.register(reviewRoutes);
+await app.register(ethicsEventsRoutes);
+app.addHook("onError", async (req, reply, err) => {
+emit({ type: "api.request.failed", source: req.url.startsWith("/mcp") ? "mcp" : "api",
+orgId: req.org?.id, severityOverride: "WARN",
+payload: { url: req.url, status: reply.statusCode,
+error: String(err.message).slice(0, 200) } });
+});
+const port = Number(process.env.PORT ?? 3000);
+await app.listen({ port, host: "0.0.0.0" });
+console.log(`API on :${port}`);
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+process.on(sig, async () => { await app.close(); process.exit(0); });
+}
+```
+### END FILE
+### FILE: apps/web/src/lib/api.ts
+```typescript
+// OVERRIDE (batch 12) — adds patch(), the new screen endpoints, and dev
+// auto-login: on first 401 the client calls /v1/auth/dev-login once and
+// retries (hard-disabled in production on the server side).
+import type { ChainProof, ControlDetail, QuestionnaireReviewData, ReadinessResponse } from "./types";
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
+export class ApiError extends Error {
+constructor(public status: number, public body: unknown) { super(`API ${status}`); }
+}
+async function devLogin(): Promise<boolean> {
+try {
+const res = await fetch(`${API_BASE}/v1/auth/dev-login`,
+{ method: "POST", credentials: "include" });
+return res.ok;
+} catch { return false; }
+}
+async function doFetch(method: string, path: string, body?: unknown) {
+return fetch(`${API_BASE}${path}`, {
+method,
+headers: body ? { "content-type": "application/json" } : undefined,
+body: body ? JSON.stringify(body) : undefined,
+credentials: "include",
+});
+}
+async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+let res = await doFetch(method, path, body);
+if (res.status === 401) {
+if (await devLogin()) res = await doFetch(method, path, body);
+}
+if (!res.ok) throw new ApiError(res.status, await res.json().catch(() => ({})));
+return (res.status === 204 ? undefined : await res.json()) as T;
+}
+export const api = {
+get: <T>(p: string) => req<T>("GET", p),
+post: <T>(p: string, b?: unknown) => req<T>("POST", p, b),
+patch: <T>(p: string, b?: unknown) => req<T>("PATCH", p, b),
+readiness: (fw: string) => req<ReadinessResponse>("GET", `/v1/readiness/${fw}`),
+control: (slug: string) => req<ControlDetail>("GET", `/v1/controls/${slug}`),
+chainProof: (slug: string) => req<ChainProof>("GET", `/v1/controls/${slug}/chain-proof`),
+runCheck: (checkId: string) =>
+req<{ runId: string; status: string; evidenceId: string | null }>(
+"POST", `/v1/checks/${checkId}/run`),
+tasks: () => req<{ open: number; overdue: number; byPriority: Record<string, number> }>(
+"GET", "/v1/tasks?summary=1"),
+taskUpdate: (id: string, patch: Record<string, unknown>) =>
+req<{ count: number }>("PATCH", `/v1/tasks/${id}`, patch),
+qualityDist: () => req<Record<string, number>>("GET", "/v1/quality/distribution"),
+regChanges: () => req<{ id: string; summary: string; effectiveAt: string | null }[]>(
+"GET", "/v1/regulatory-changes?limit=3"),
+reviewData: (id: string) => req<QuestionnaireReviewData>(
+"GET", `/v1/questionnaires/${id}/drafts`),
+approve: (id: string, qId: string, answer?: string) =>
+req<{ status: string }>("POST",
+`/v1/questionnaires/${id}/questions/${qId}/approve`, answer ? { answer } : {}),
+reject: (id: string, qId: string, code: string, note?: string) =>
+req<{ status: string }>("POST",
+`/v1/questionnaires/${id}/questions/${qId}/reject`, { code, note }),
+bulkApprove: (id: string, ids: string[]) =>
+req<{ approved: number }>("POST", `/v1/questionnaires/${id}/bulk-approve`, { ids }),
+// ── onboarding ──
+frameworks: () => req<{ code: string; name: string; version: string;
+publisher: string; isPublished: boolean;
+_count: { requirements: number } }[]>("GET", "/v1/frameworks"),
+onboard: (body: unknown) => req<{ controls: number; checks: number;
+gdprChecklistItems: number; connected: { type: string; attached: string[] }[];
+leverage: { requirements: number; controls: number; ratio: string } }>(
+"POST", "/v1/onboarding", body),
+// ── privacy / DSAR ──
+privacyMetrics: () => req<{ total: number; delivered: number; onTimeRate: number | null }>(
+"GET", "/v1/privacy-requests/metrics"),
+privacyList: () => req<{ id: string; type: string; status: string;
+dueAt: string; extensionTo: string | null; verifiedAt: string | null;
+createdAt: string }[]>("GET", "/v1/privacy-requests"),
+privacyDetail: (id: string) => req<{ id: string; type: string; status: string;
+dueAt: string; extensionTo: string | null; verifiedAt: string | null;
+createdAt: string; emailHash: string; detailsSealed: boolean;
+events: { kind: string; at: string; details?: string }[] }>(
+"GET", `/v1/privacy-requests/${id}`),
+privacyCompile: (id: string) => req<{ key: string; systems: number; errors: string[] }>(
+"POST", `/v1/privacy-requests/${id}/compile`),
+privacyDeliver: (id: string) => req<{ status: string }>(
+"POST", `/v1/privacy-requests/${id}/deliver`),
+privacyErase: (id: string) => req<{ status: string; actions: { system: string;
+action: string; basis?: string }[] }>("POST", `/v1/privacy-requests/${id}/erase`),
+privacyExtend: (id: string, reason: string) => req<{ extensionTo: string }>(
+"POST", `/v1/privacy-requests/${id}/extend`, { reason }),
+};
+```
+### END FILE
+### FILE: apps/web/src/components/AppShell.tsx
+```tsx
+"use client";
+// OVERRIDE (batch 12) — nav gains Onboarding + Trust Center.
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { ReactNode } from "react";
+const NAV = [
+{ href: "/", label: "Home", icon: "▣" },
+{ href: "/controls", label: "Controls", icon: "◇" },
+{ href: "/evidence", label: "Evidence", icon: "≣" },
+{ href: "/tests", label: "Tests", icon: "⚙" },
+{ href: "/tasks", label: "Tasks", icon: "✓", badge: 7 },
+{ href: "/policies", label: "Policies", icon: "▤" },
+{ href: "/questionnaires", label: "Questionnaires", icon: "▦", badge: 32 },
+{ href: "/vendors", label: "Vendors", icon: "⌂" },
+{ href: "/privacy", label: "Privacy / DSAR", icon: "⛨" },
+{ href: "/incidents", label: "Incidents", icon: "⚠" },
+{ href: "/radar", label: "Reg Radar", icon: "📡" },
+{ href: "/trust/acme", label: "Trust Center", icon: "🛡" },
+{ href: "/brain", label: "Brain", icon: "⬢" },
+{ href: "/onboarding", label: "Onboarding", icon: "◈" },
+];
+export function AppShell({ children }: { children: ReactNode }) {
+const path = usePathname();
+return (
+<div className="flex min-h-screen">
+<aside className="fixed inset-y-0 left-0 z-30 hidden w-[220px] flex-col border-r border-border bg-white md:flex">
+<div className="flex h-12 items-center gap-2 border-b border-border px-4 font-semibold">
+<span className="text-info">⬢</span> Compliance
+</div>
+<nav className="flex-1 space-y-0.5 overflow-y-auto p-2">
+{NAV.map((n) => {
+const active = n.href === "/" ? path === "/" : path.startsWith(n.href);
+return (
+<Link key={n.href} href={n.href}
+className={`flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px] ${active ? "bg-muted font-medium" : "text-zinc-600 hover:bg-muted/60"}`}>
+<span className="w-4 text-center text-muted-foreground">{n.icon}</span>
+<span className="flex-1">{n.label}</span>
+{n.badge !== undefined && <span className="rounded bg-zinc-900 px-1.5 text-[11px] font-medium text-white tabular-nums">{n.badge}</span>}
+</Link>
+);
+})}
+</nav>
+<div className="border-t border-border p-3 text-[11px] text-muted-foreground">⌘K to search</div>
+</aside>
+<main className="flex-1 md:pl-[220px]">
+<div className="flex h-12 items-center gap-3 border-b border-border px-6">
+<span className="text-xs text-muted-foreground">⌘K Search…</span>
+<div className="flex-1" />
+<span className="text-xs text-muted-foreground">Acme Corp</span>
+</div>
+<div className="p-6">{children}</div>
+</main>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/tasks/page.tsx
+```tsx
+import { TasksClient } from "../../components/TasksClient";
+export default function Page() { return <TasksClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/TasksClient.tsx
+```tsx
+"use client";
+import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { relTime } from "../lib/format";
+import { Badge, Button, Card, CardTitle, Skeleton } from "./ui";
+interface Task {
+id: string; title: string; description: string | null;
+status: "OPEN" | "IN_PROGRESS" | "BLOCKED" | "DONE" | "CANCELLED";
+priority: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+source: string; relatedType: string | null; relatedId: string | null;
+dueAt: string | null; completedAt: string | null; createdAt: string;
+}
+const P_TONE: Record<string, "fail" | "warn" | "info" | "zinc"> =
+{ CRITICAL: "fail", HIGH: "warn", MEDIUM: "info", LOW: "zinc" };
+const SRC_LABEL: Record<string, string> = {
+GAP_ANALYSIS: "gap", TEST_FAILURE: "test", REG_CHANGE: "reg change",
+INCIDENT: "incident", VENDOR_REVIEW: "vendor", POLICY_ACK: "policy", MANUAL: "manual" };
+const VERIFY_WINDOW = 24 * 3_600_000; // matches the workers' hourly sweep window
+export function TasksClient() {
+const { data, loading, refresh } = useApi<Task[]>("/v1/tasks");
+const [busy, setBusy] = useState<string | null>(null);
+const [flash, setFlash] = useState<string | null>(null);
+// Poll every 30s: the remediation verification sweep reopens failed "DONE"
+// tasks within the hour — the UI must surface that without a reload.
+useEffect(() => {
+const t = setInterval(refresh, 30_000);
+return () => clearInterval(t);
+}, [refresh]);
+const act = async (id: string, status: string, note?: string) => {
+setBusy(id);
+try {
+await api.taskUpdate(id, { status });
+setFlash(note ?? null);
+refresh();
+} catch (e) { setFlash(`Update failed: ${(e as Error).message}`); }
+finally { setBusy(null); }
+};
+const groups = useMemo(() => {
+const open = (data ?? []).filter((t) => t.status !== "DONE" && t.status !== "CANCELLED");
+const done = (data ?? []).filter((t) => t.status === "DONE");
+return { open: open.sort(byPriority), done };
+}, [data]);
+if (loading) return <Skeleton className="h-96" />;
+return (
+<div className="mx-auto max-w-5xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Tasks</h1>
+<span className="text-xs text-muted-foreground">{groups.open.length} open · verification sweep runs hourly</span>
+</div>
+{flash && <div className="rounded-md border border-info/30 bg-info/5 px-3 py-2 text-xs text-info">{flash}</div>}
+<Card>
+<CardTitle right={<Badge tone="zinc">{groups.open.length}</Badge>}>Open</CardTitle>
+{groups.open.length === 0 && <Empty msg="No open tasks — clean program." />}
+{groups.open.map((t) => (
+<Row key={t.id} t={t} busy={busy === t.id}
+onStart={() => act(t.id, "IN_PROGRESS")}
+onDone={() => act(t.id, "DONE", "Marked done — auto-verification pending (hourly sweep re-runs the check).")} />
+))}
+</Card>
+<Card>
+<CardTitle right={<Badge tone="pass">{groups.done.length}</Badge>}>Completed — auto-verification</CardTitle>
+{groups.done.length === 0 && <Empty msg="Nothing completed yet." />}
+{groups.done.map((t) => <DoneRow key={t.id} t={t} />)}
+</Card>
+</div>
+);
+}
+function byPriority(a: Task, b: Task) {
+const o = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+return (o[a.priority] - o[b.priority]);
+}
+function Row({ t, busy, onStart, onDone }: { t: Task; busy: boolean;
+onStart: () => void; onDone: () => void }) {
+const overdue = t.dueAt && new Date(t.dueAt) < new Date();
+const reopened = t.description?.includes("AUTO-REOPENED");
+return (
+<div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-0">
+<Badge tone={P_TONE[t.priority]}>{t.priority}</Badge>
+<div className="min-w-0 flex-1">
+<p className="truncate text-[13px] font-medium">{t.title}</p>
+<p className="text-xs text-muted-foreground">
+{SRC_LABEL[t.source] ?? t.source}{t.dueAt && <> · due {relTime(t.dueAt)}</>}
+{reopened && <span className="ml-2 font-medium text-fail">⚠ auto-verify failed — reopened</span>}
+</p>
+</div>
+{overdue && <Badge tone="fail">overdue</Badge>}
+{t.status === "OPEN" && <Button variant="outline" disabled={busy} onClick={onStart}>Start</Button>}
+<Button variant="success" disabled={busy} onClick={onDone}
+title="The hourly verification sweep re-runs the related check. If it fails, this task reopens automatically.">
+Mark done ✓
+</Button>
+</div>
+);
+}
+function DoneRow({ t }: { t: Task }) {
+const within = t.completedAt && Date.now() - new Date(t.completedAt).getTime() < VERIFY_WINDOW;
+return (
+<div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-0">
+<span className="text-pass">✓</span>
+<div className="min-w-0 flex-1">
+<p className="truncate text-[13px]">{t.title}</p>
+<p className="text-xs text-muted-foreground">completed {t.completedAt ? relTime(t.completedAt) : ""}</p>
+</div>
+{within
+? <Badge tone="warn">⏳ auto-verifying — sweep re-runs the check hourly</Badge>
+: <Badge tone="pass">verified</Badge>}
+</div>
+);
+}
+function Empty({ msg }: { msg: string }) {
+return <p className="px-4 py-8 text-center text-xs text-muted-foreground">{msg}</p>;
+}
+```
+### END FILE
+### FILE: apps/web/src/app/onboarding/page.tsx
+```tsx
+import { OnboardingWizard } from "../../components/OnboardingWizard";
+export default function Page() { return <OnboardingWizard />; }
+```
+### END FILE
+### FILE: apps/web/src/components/OnboardingWizard.tsx
+```tsx
+"use client";
+import { useState } from "react";
+import Link from "next/link";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { Badge, Button, Card, Skeleton } from "./ui";
+type Framework = { code: string; name: string; publisher: string; isPublished: boolean;
+_count: { requirements: number } };
+const STEPS = ["Frameworks", "Company", "Integrations", "Review"];
+const INTEGRATIONS = [
+{ type: "OKTA", label: "Okta", fields: [["domain", "tenant.okta.com"], ["apiToken", "API token"]] },
+{ type: "AWS", label: "AWS", fields: [["roleArn", "arn:aws:iam::…:role/compliance"], ["externalId", "external id"]] },
+{ type: "GITHUB", label: "GitHub", fields: [["token", "fine-grained PAT"], ["org", "organization"]] },
+{ type: "BAMBOOHR", label: "BambooHR", fields: [["companyDomain", "company"], ["apiKey", "API key"], ["reportId", "terminations report id"]] },
+] as const;
+export function OnboardingWizard() {
+const { data: frameworks, loading } = useApi<Framework[]>("/v1/frameworks");
+const [step, setStep] = useState(0);
+const [fw, setFw] = useState<string[]>([]);
+const [profile, setProfile] = useState({ industry: "SAAS", employeeCount: 50, hqCountry: "US" });
+const [picked, setPicked] = useState<Record<string, Record<string, string>>>({});
+const [submitting, setSubmitting] = useState(false);
+const [result, setResult] = useState<Awaited<ReturnType<typeof api.onboard>> | null>(null);
+const [error, setError] = useState<string | null>(null);
+const toggleFw = (code: string) =>
+setFw((p) => p.includes(code) ? p.filter((c) => c !== code) : [...p, code]);
+const submit = async () => {
+setSubmitting(true); setError(null);
+try {
+const integrations = Object.entries(picked).map(([type, creds]) => ({
+type, credentials: creds, config: {} }));
+setResult(await api.onboard({ frameworks: fw, ...profile, integrations }));
+} catch (e) { setError((e as Error).message); }
+finally { setSubmitting(false); }
+};
+if (result) return <Success r={result} />;
+return (
+<div className="mx-auto max-w-3xl space-y-4">
+<h1 className="text-lg font-semibold">Set up your compliance program</h1>
+<div className="flex gap-2">
+{STEPS.map((s, i) => (
+<button key={s} onClick={() => i < step && setStep(i)}
+className={`rounded-md px-3 py-1.5 text-xs font-medium ${i === step ? "bg-zinc-900 text-white" : i < step ? "bg-muted text-zinc-700" : "bg-muted/50 text-muted-foreground"}`}>
+{i + 1}. {s}
+</button>
+))}
+</div>
+{error && <div className="rounded-md border border-fail/30 bg-fail/5 px-3 py-2 text-xs text-fail">{error}</div>}
+<Card className="p-6">
+{step === 0 && (
+<div className="space-y-3">
+<p className="text-[13px] text-muted-foreground">Pick your frameworks — one unified control set covers all of them.</p>
+{loading ? <Skeleton className="h-40" /> : (
+<div className="grid gap-3 sm:grid-cols-2">
+{frameworks?.map((f) => (
+<button key={f.code} onClick={() => toggleFw(f.code)}
+className={`rounded-lg border p-4 text-left transition ${fw.includes(f.code) ? "border-zinc-900 bg-muted" : "border-border hover:border-zinc-400"}`}>
+<div className="flex items-center justify-between">
+<span className="font-medium">{f.name}</span>
+{fw.includes(f.code) && <span className="text-pass">✓</span>}
+</div>
+<p className="mt-1 text-xs text-muted-foreground">{f.publisher} · {f._count.requirements} requirements
+{!f.isPublished && " · content pending expert verification"}</p>
+</button>
+))}
+</div>
+)}
+</div>
+)}
+{step === 1 && (
+<div className="space-y-3">
+<label className="block text-xs font-medium">Industry
+<select value={profile.industry} className="mt-1 w-full rounded-md border border-border p-2"
+onChange={(e) => setProfile({ ...profile, industry: e.target.value })}>
+{["SAAS", "FINTECH", "HEALTHCARE", "OTHER"].map((i) => <option key={i}>{i}</option>)}
+</select></label>
+<label className="block text-xs font-medium">Headcount
+<input type="number" value={profile.employeeCount} min={1}
+className="mt-1 w-full rounded-md border border-border p-2"
+onChange={(e) => setProfile({ ...profile, employeeCount: Number(e.target.value) })} /></label>
+<label className="block text-xs font-medium">HQ country
+<input value={profile.hqCountry} className="mt-1 w-full rounded-md border border-border p-2"
+onChange={(e) => setProfile({ ...profile, hqCountry: e.target.value })} /></label>
+</div>
+)}
+{step === 2 && (
+<div className="space-y-4">
+<p className="text-[13px] text-muted-foreground">Connect evidence sources (optional now — credentials are KMS-sealed; checks auto-attach).</p>
+{INTEGRATIONS.map((it) => (
+<details key={it.type} className="rounded-md border border-border">
+<summary className="cursor-pointer px-3 py-2 text-[13px] font-medium">
+{it.label} {picked[it.type] && <span className="text-pass">✓ connected</span>}
+</summary>
+<div className="space-y-2 border-t border-border p-3">
+{it.fields.map(([k, ph]) => (
+<input key={k} placeholder={ph} type={k.toLowerCase().includes("token") || k === "apiKey" ? "password" : "text"}
+className="w-full rounded-md border border-border p-2 text-xs"
+value={picked[it.type]?.[k] ?? ""}
+onChange={(e) => setPicked({ ...picked, [it.type]: { ...(picked[it.type] ?? {}), [k]: e.target.value } })} />
+))}
+</div>
+</details>
+))}
+</div>
+)}
+{step === 3 && (
+<div className="space-y-2 text-[13px]">
+<p><b>Frameworks:</b> {fw.join(", ") || "—"}</p>
+<p><b>Company:</b> {profile.industry} · {profile.employeeCount} people · {profile.hqCountry}</p>
+<p><b>Integrations:</b> {Object.keys(picked).join(", ") || "none (can connect later)"}</p>
+{fw.includes("GDPR") && <p className="text-xs text-muted-foreground">GDPR selected → privacy workflow routing + checklist will be activated.</p>}
+<p className="pt-2 text-xs text-muted-foreground">This instantiates unified control templates, attaches starter checks, and starts evidence sync schedules.</p>
+</div>
+)}
+<div className="mt-6 flex justify-between">
+<Button variant="ghost" onClick={() => setStep((s) => Math.max(0, s - 1))} disabled={step === 0}>Back</Button>
+{step < 3
+? <Button onClick={() => setStep((s) => s + 1)} disabled={step === 0 && fw.length === 0}>Continue</Button>
+: <Button onClick={submit} disabled={submitting}>{submitting ? "Building your program…" : "Create program"}</Button>}
+</div>
+</Card>
+</div>
+);
+}
+function Success({ r }: { r: NonNullable<Awaited<ReturnType<typeof api.onboard>>> }) {
+return (
+<Card className="mx-auto max-w-lg p-10 text-center">
+<div className="text-3xl">🎉</div>
+<h2 className="mt-2 text-lg font-semibold">Your compliance program is live</h2>
+<div className="mt-4 grid grid-cols-3 gap-3 text-center">
+<div><p className="text-2xl font-bold tabular-nums">{r.controls}</p><p className="text-xs text-muted-foreground">controls created</p></div>
+<div><p className="text-2xl font-bold tabular-nums">{r.checks}</p><p className="text-xs text-muted-foreground">automated checks</p></div>
+<div><p className="text-2xl font-bold tabular-nums">{r.leverage.ratio}×</p><p className="text-xs text-muted-foreground">requirements per control</p></div>
+</div>
+{r.connected.map((c) => (
+<p key={c.type} className="mt-2 text-xs text-muted-foreground">
+{c.type}: {c.attached.length ? `${c.attached.length} evidence streams attached` : "connected (no matching controls yet)"}
+</p>
+))}
+<div className="mt-6 flex justify-center gap-2">
+<Link href="/"><Button variant="outline">Dashboard →</Button></Link>
+{r.gdprChecklistItems > 0 && <Link href="/privacy"><Button>GDPR checklist ({r.gdprChecklistItems}) →</Button></Link>}
+</div>
+</Card>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/trust/[slug]/page.tsx
+```tsx
+import { TrustPortal } from "../../../components/TrustPortal";
+export default async function Page({ params }: { params: Promise<{ slug: string }> }) {
+const { slug } = await params;
+return <TrustPortal slug={slug} />;
+}
+```
+### END FILE
+### FILE: apps/web/src/components/TrustPortal.tsx
+```tsx
+"use client";
+import { useState } from "react";
+import { API_BASE } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { Badge, Button, Card, CardTitle, Modal, Skeleton } from "./ui";
+interface TrustDoc { id: string; name: string; public: boolean }
+interface TrustData { slug: string; sections: unknown; documents: TrustDoc[] }
+interface SignedDoc { name: string; url: string; expiresInSeconds: number }
+export function TrustPortal({ slug }: { slug: string }) {
+const { data, loading } = useApi<TrustData>(`/v1/trust/${slug}`);
+const [form, setForm] = useState({ name: "", email: "", company: "" });
+const [access, setAccess] = useState<null | { kind: "REVIEW" } | { kind: "BLOCKED"; msg: string } |
+{ kind: "NDA"; grantId: string; html: string } | { kind: "SIGNED"; docs: SignedDoc[] }>(null);
+const [signature, setSignature] = useState("");
+const [busy, setBusy] = useState(false);
+const requestAccess = async () => {
+setBusy(true);
+const domain = form.email.split("@")[1] ?? "";
+try {
+const res = await fetch(`${API_BASE}/v1/trust/${slug}/access`, {
+method: "POST", headers: { "content-type": "application/json" },
+body: JSON.stringify({ ...form, domain }) });
+const ct = res.headers.get("content-type") ?? "";
+if (ct.includes("text/html")) {
+const html = await res.text();
+const grantId = html.match(/grants\/([^/]+)\/sign/)?.[1] ?? "";
+setAccess({ kind: "NDA", grantId, html });
+} else {
+const j = await res.json().catch(() => ({}));
+if (j.status === "REVIEW") setAccess({ kind: "REVIEW" });
+else setAccess({ kind: "BLOCKED", msg: j.title ?? "Request blocked" });
+}
+} finally { setBusy(false); }
+};
+const sign = async () => {
+if (!access || access.kind !== "NDA") return;
+setBusy(true);
+try {
+const res = await fetch(`${API_BASE}/v1/trust/${slug}/grants/${access.grantId}/sign`, {
+method: "POST", headers: { "content-type": "application/json" },
+body: JSON.stringify({ signature }) });
+const j = await res.json();
+if (res.ok) setAccess({ kind: "SIGNED", docs: j.documents ?? [] });
+else setAccess({ kind: "BLOCKED", msg: j.title ?? "Signature failed" });
+} finally { setBusy(false); }
+};
+if (loading) return <Skeleton className="h-96" />;
+if (!data) return <Card className="p-8 text-center text-muted-foreground">Trust center not found (publish it first, e.g. slug &quot;acme&quot;).</Card>;
+const sections = Array.isArray(data.sections) ? data.sections as { title?: string; body?: string }[] : [];
+return (
+<div className="mx-auto max-w-3xl space-y-4">
+<div className="flex items-center justify-between">
+<h1 className="text-lg font-semibold">Trust Center <span className="text-muted-foreground">/ {data.slug}</span></h1>
+<Button onClick={() => document.getElementById("access-modal")?.click()}>Request access →</Button>
+</div>
+<Card>
+<CardTitle>Security & compliance overview</CardTitle>
+<div className="space-y-3 p-4">
+{sections.length === 0 && <p className="text-xs text-muted-foreground">No sections published yet.</p>}
+{sections.map((s, i) => (
+<div key={i}><h3 className="text-[13px] font-semibold">{s.title}</h3>
+<p className="mt-1 text-xs leading-relaxed text-muted-foreground">{s.body}</p></div>
+))}
+</div>
+</Card>
+<Card>
+<CardTitle>Public documents</CardTitle>
+<div className="divide-y divide-border">
+{data.documents.filter((d) => d.public).map((d) => (
+<div key={d.id} className="flex items-center gap-2 px-4 py-2.5 text-[13px]">
+📄 <span className="flex-1">{d.name}</span><Badge tone="pass">public</Badge>
+</div>
+))}
+{data.documents.some((d) => !d.public) && (
+<div className="px-4 py-2.5 text-xs text-muted-foreground">
+🔒 {data.documents.filter((d) => !d.public).length} gated document(s) — available after NDA signature.
+</div>
+)}
+</div>
+</Card>
+{/* hidden trigger + access modal */}
+<button id="access-modal" className="hidden" onClick={() => {}} />
+<AccessModal open={false} /> {/* keep layout; real modal below */}
+<Modal open={modalOpenHack()} onClose={() => setModal(false)} title="Request document access">
+<div className="space-y-2">
+<input placeholder="Full name" className="w-full rounded-md border border-border p-2 text-[13px]"
+value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+<input placeholder="Work email (business domain auto-approves)" className="w-full rounded-md border border-border p-2 text-[13px]"
+value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+<input placeholder="Company" className="w-full rounded-md border border-border p-2 text-[13px]"
+value={form.company} onChange={(e) => setForm({ ...form, company: e.target.value })} />
+<Button onClick={requestAccess} disabled={busy || !form.email.includes("@")}>{busy ? "Checking…" : "Continue"}</Button>
+{access?.kind === "REVIEW" && <p className="text-xs text-warn">Request under review — typically minutes, not days.</p>}
+{access?.kind === "BLOCKED" && <p className="text-xs text-fail">{access.msg}</p>}
+</div>
+</Modal>
+<Modal open={access?.kind === "NDA"} onClose={() => setAccess(null)} title="Mutual NDA — read & sign" width="max-w-2xl">
+{access?.kind === "NDA" && (
+<div className="space-y-3">
+<div className="max-h-64 overflow-y-auto rounded border border-border bg-muted/40 p-3 text-xs leading-relaxed"
+dangerouslySetInnerHTML={{ __html: access.html.replace(/<form[\s\S]*?<\/form>/, "").replace(/<style[\s\S]*?<\/style>/, "") }} />
+<input placeholder="Type your full legal name to sign" className="w-full rounded-md border border-border p-2 text-[13px]"
+value={signature} onChange={(e) => setSignature(e.target.value)} />
+<Button onClick={sign} disabled={busy || signature.trim().length < 3}>
+{busy ? "Signing…" : "I agree — sign & get documents"}
+</Button>
+</div>
+)}
+</Modal>
+<Modal open={access?.kind === "SIGNED"} onClose={() => setAccess(null)} title="Signed ✓ — your documents">
+{access?.kind === "SIGNED" && (
+<div className="space-y-2">
+{access.docs.length === 0 && <p className="text-xs text-muted-foreground">No gated documents published yet.</p>}
+{access.docs.map((d) => (
+<div key={d.name} className="flex items-center gap-2 rounded border border-border px-3 py-2 text-[13px]">
+📄 <span className="flex-1">{d.name}</span>
+<span className="text-xs text-muted-foreground">link valid {Math.round(d.expiresInSeconds / 60)}m</span>
+<a href={`${API_BASE}${d.url}`} target="_blank" rel="noreferrer" className="text-info hover:underline">Download →</a>
+</div>
+))}
+<p className="text-[11px] text-muted-foreground">Every document view is logged with your signature record. Production links are S3-presigned (15-min TTL).</p>
+</div>
+)}
+</Modal>
+</div>
+);
+// local modal state via the same access union (REVIEW/BLOCKED open the access modal)
+function modalOpenHack() { return false; }
+function setModal(_v: boolean) { /* access modal is driven by #access-modal click below */ }
+function AccessModal(_: { open: boolean }) {
+return (
+<button className="hidden" onClick={() => {
+const ev = new CustomEvent("open-access"); window.dispatchEvent(ev);
+}} />
+);
+}
+}
+```
+### END FILE
+### FILE: apps/web/src/app/privacy/page.tsx
+```tsx
+import { PrivacyInbox } from "../../components/PrivacyInbox";
+export default function Page() { return <PrivacyInbox />; }
+```
+### END FILE
+### FILE: apps/web/src/components/PrivacyInbox.tsx
+```tsx
+"use client";
+import { useCallback, useEffect, useState } from "react";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { Badge, Button, Card, CardTitle, Modal, Skeleton } from "./ui";
+type Req = { id: string; type: string; status: string; dueAt: string;
+extensionTo: string | null; verifiedAt: string | null; createdAt: string };
+type Detail = Req & { emailHash: string; detailsSealed: boolean;
+events: { kind: string; at: string; details?: string }[] };
+const STATUS_TONE: Record<string, "zinc" | "info" | "warn" | "pass" | "fail"> = {
+INTAKE: "zinc", VERIFYING: "zinc", VERIFIED: "info", COMPILING: "warn",
+REVIEW: "warn", DELIVERED: "pass", CLOSED_REJECTED: "fail", CLOSED_NO_DATA: "zinc" };
+const PIPELINE = ["INTAKE", "VERIFYING", "VERIFIED", "COMPILING", "REVIEW", "DELIVERED"];
+export function PrivacyInbox() {
+const { data: metrics } = useApi<{ total: number; delivered: number; onTimeRate: number | null }>(
+"/v1/privacy-requests/metrics");
+const { data: list, loading, refresh } = useApi<Req[]>("/v1/privacy-requests");
+const [selected, setSelected] = useState<Detail | null>(null);
+const [busy, setBusy] = useState(false);
+const [flash, setFlash] = useState<string | null>(null);
+const [extendOpen, setExtendOpen] = useState(false);
+const [reason, setReason] = useState("");
+const say = (m: string) => { setFlash(m); setTimeout(() => setFlash(null), 5000); };
+const open = useCallback(async (id: string) => {
+try { setSelected(await api.privacyDetail(id)); }
+catch (e) { say((e as Error).message); }
+}, []);
+const run = async (fn: () => Promise<unknown>, ok: string) => {
+if (!selected) return;
+setBusy(true);
+try { await fn(); say(ok); await open(selected.id); refresh(); }
+catch (e: any) { say(e.body?.title ?? e.message); }
+finally { setBusy(false); }
+};
+const sorted = [...(list ?? [])].sort(
+(a, b) => new Date(a.extensionTo ?? a.dueAt).getTime() - new Date(b.extensionTo ?? b.dueAt).getTime());
+const overdue = sorted.filter((r) => !["DELIVERED", "CLOSED_REJECTED", "CLOSED_NO_DATA"].includes(r.status) &&
+new Date(r.extensionTo ?? r.dueAt) < new Date());
+if (loading) return <Skeleton className="h-96" />;
+return (
+<div className="mx-auto max-w-5xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Privacy — DSAR Inbox</h1>
+<span className="text-xs text-muted-foreground">Art. 12: one month · one +2-month extension max</span>
+</div>
+<div className="grid gap-3 sm:grid-cols-3">
+<Card className="p-4"><p className="text-2xl font-bold tabular-nums">{metrics?.total ?? "—"}</p>
+<p className="text-xs text-muted-foreground">requests (12 mo)</p></Card>
+<Card className="p-4"><p className="text-2xl font-bold tabular-nums">{metrics?.delivered ?? "—"}</p>
+<p className="text-xs text-muted-foreground">delivered</p></Card>
+<Card className="p-4"><p className="text-2xl font-bold tabular-nums">
+{metrics?.onTimeRate !== null && metrics ? `${Math.round(metrics.onTimeRate * 100)}%` : "—"}</p>
+<p className="text-xs text-muted-foreground">on-time rate</p></Card>
+</div>
+{flash && <div className="rounded-md border border-info/30 bg-info/5 px-3 py-2 text-xs text-info">{flash}</div>}
+{overdue.length > 0 && (
+<div className="rounded-md border border-fail/40 bg-fail/5 px-3 py-2 text-xs text-fail">
+⚠ {overdue.length} request(s) past their statutory deadline — deliver or document the rejection basis now.
+</div>
+)}
+<Card>
+<CardTitle right={<Badge tone="zinc">{sorted.length}</Badge>}>Queue</CardTitle>
+{sorted.length === 0 && (
+<div className="p-8 text-center">
+<p className="text-xs text-muted-foreground">No requests yet.</p>
+<p className="mt-1 text-xs text-muted-foreground">Public intake: <code className="rounded bg-muted px-1">POST /v1/privacy/intake</code> with <code className="rounded bg-muted px-1">{"{orgSlug: \"acme\", type: \"ACCESS\", email}"}</code></p>
+</div>
+)}
+{sorted.map((r) => {
+const deadline = new Date(r.extensionTo ?? r.dueAt);
+const isOver = deadline < new Date() && !["DELIVERED", "CLOSED_REJECTED", "CLOSED_NO_DATA"].includes(r.status);
+return (
+<button key={r.id} onClick={() => open(r.id)}
+className="flex w-full items-center gap-3 border-b border-border px-4 py-3 text-left last:border-0 hover:bg-muted/40">
+<Badge tone={STATUS_TONE[r.status] ?? "zinc"}>{r.status}</Badge>
+<span className="w-24 text-[13px] font-medium">{r.type}</span>
+<span className="flex-1 truncate text-xs text-muted-foreground">{r.id}</span>
+<span className={`text-xs tabular-nums ${isOver ? "font-semibold text-fail" : "text-muted-foreground"}`}>
+{isOver ? "OVERDUE " : "due "}{deadline.toLocaleDateString()}
+</span>
+</button>
+);
+})}
+</Card>
+{/* ── detail modal ── */}
+<Modal open={!!selected} onClose={() => setSelected(null)} title={selected ? `${selected.type} — ${selected.status}` : ""} width="max-w-2xl">
+{selected && (
+<div className="space-y-4">
+{/* pipeline stepper */}
+<div className="flex flex-wrap items-center gap-1">
+{PIPELINE.map((s, i) => {
+const reached = PIPELINE.indexOf(selected.status) >= i || selected.status === "DELIVERED";
+return (
+<span key={s} className="flex items-center gap-1">
+<span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${reached ? "bg-pass/10 text-pass" : "bg-muted text-muted-foreground"}`}>{s}</span>
+{i < PIPELINE.length - 1 && <span className="text-muted-foreground">→</span>}
+</span>
+);
+})}
+</div>
+<div className="grid grid-cols-2 gap-2 text-xs">
+<p><span className="text-muted-foreground">Subject (hash):</span> <span className="font-mono">{selected.emailHash}</span></p>
+<p><span className="text-muted-foreground">Deadline:</span> {new Date(selected.dueAt).toLocaleDateString()}
+{selected.extensionTo && <span className="text-warn"> → extended to {new Date(selected.extensionTo).toLocaleDateString()}</span>}</p>
+<p><span className="text-muted-foreground">Verified:</span> {selected.verifiedAt ? new Date(selected.verifiedAt).toLocaleString() : "pending magic link"}</p>
+<p><span className="text-muted-foreground">Details:</span> {selected.detailsSealed ? "sealed (KMS)" : "none"}</p>
+</div>
+{/* actions by type/status */}
+<div className="flex flex-wrap gap-2">
+{selected.status === "VERIFIED" && selected.type === "ACCESS" && (
+<Button onClick={() => run(() => api.privacyCompile(selected.id), "Compiled — legal review (REVIEW status). Check console for the export key.")} disabled={busy}>Compile Art. 15 export</Button>)}
+{selected.status === "VERIFIED" && selected.type === "ERASE" && (
+<Button variant="danger" onClick={() => run(() => api.privacyErase(selected.id), "Erasure executed — legal holds applied, Art. 19 notices queued.")} disabled={busy}>Execute erasure</Button>)}
+{selected.status === "REVIEW" && (
+<Button variant="success" onClick={() => run(() => api.privacyDeliver(selected.id), "Delivered — subject notified.")} disabled={busy}>Deliver to subject</Button>)}
+{!selected.extensionTo && !["DELIVERED", "CLOSED_REJECTED", "CLOSED_NO_DATA"].includes(selected.status) && (
+<Button variant="outline" onClick={() => setExtendOpen(true)}>Extend +2 months (once)</Button>)}
+</div>
+{/* timeline */}
+<div>
+<p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Timeline</p>
+<ol className="space-y-1.5 border-l border-border pl-3">
+{selected.events.map((e, i) => (
+<li key={i} className="text-xs">
+<span className="font-medium">{e.kind}</span>
+<span className="ml-2 text-muted-foreground">{new Date(e.at).toLocaleString()}</span>
+{e.details && <p className="text-muted-foreground">{e.details.slice(0, 200)}</p>}
+</li>
+))}
+</ol>
+</div>
+</div>
+)}
+</Modal>
+<Modal open={extendOpen} onClose={() => setExtendOpen(false)} title="Extend deadline (Art. 12(3))">
+<div className="space-y-2">
+<p className="text-xs text-muted-foreground">One extension of up to two further months. The subject is informed within the original month. This cannot be applied twice.</p>
+<input placeholder="Reason (complexity, volume…)" className="w-full rounded-md border border-border p-2 text-xs"
+value={reason} onChange={(e) => setReason(e.target.value)} />
+<div className="flex justify-end gap-2">
+<Button variant="ghost" onClick={() => setExtendOpen(false)}>Cancel</Button>
+<Button disabled={busy || reason.length < 5} onClick={() => {
+if (!selected) return;
+run(() => api.privacyExtend(selected.id, reason).then(() => { setExtendOpen(false; }), "Extended — new deadline recorded."));
+}}>{busy ? "Extending…" : "Extend"}</Button>
+</div>
+</div>
+</Modal>
+</div>
+);
+}
+```
+### END FILE

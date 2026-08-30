@@ -1,0 +1,141 @@
+### FILE: apps/web/src/app/layout.tsx
+```tsx
+import "../styles/globals.css"; // FIX: was "./styles/globals.css" (src/app/styles doesn't exist)
+import { AppShell } from "../components/AppShell";
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en"><body>
+      <AppShell>{children}</AppShell>
+    </body></html>
+  );
+}
+```
+### END FILE
+### FILE: apps/web/tsconfig.json
+```json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "preserve",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "allowJs": true,
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "baseUrl": "."
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}
+```
+### END FILE
+### FILE: packages/db/seed/prompts.ts
+```typescript
+// FIX: relative import was ../../../agents/... (resolves to <root>/agents).
+// From packages/db/seed, the agents package is ../../agents.
+import { prisma } from "../src/client";
+import { PROMPT_SEED_FILES } from "../../agents/src/prompts";
+async function main() {
+  for (const p of PROMPT_SEED_FILES) {
+    await prisma.promptTemplate.upsert({
+      where: { key_version: { key: p.key, version: p.version } },
+      update: { systemPrompt: p.systemPrompt, name: p.name,
+        modelConfig: p.modelConfig as object },
+      create: {
+        key: p.key, version: p.version, name: p.name,
+        systemPrompt: p.systemPrompt, userTemplate: p.userTemplate,
+        modelConfig: p.modelConfig as object, status: "ACTIVE",
+      },
+    });
+  }
+  console.log(`Seeded ${PROMPT_SEED_FILES.length} prompt templates.`);
+}
+main().finally(() => prisma.$disconnect());
+```
+### END FILE
+### FILE: docs/HARDENING.md
+```markdown
+# Hardening Roadmap — "best in system" program
+P0 (do now): apply batch-11 surgical patches (below); run `pnpm test`,
+`pnpm audit:rls`, `pnpm sdk:generate` (drift check), boot smoke.
+P1 (pre-demo): seed a demo org (controls+evidence+tasks) so screens render rich;
+start schedules; verify SSE live feed; external deadman on /healthz (brain).
+P2 (production gates): Redis-backed rate limits (replace in-memory buckets);
+SES/Postmark swap for notify(); S3 presign in trust center; DSAR export → S3
+(privacy KMS, 14d TTL); PgBouncer in TRANSACTION mode (rlsClient contract);
+backup/restore drill for all three DBs; dependabot + secret scanning.
+P3 (product depth): remaining screens (Incidents w/ countdowns, Onboarding,
+Brain dashboard), ⌘K palette, Playwright e2e for the three built screens,
+Grafana dashboards over Brain health snapshots.
+```
+### END FILE
+````
+
+## Step 3 — Six surgical patches (apply by hand; too large to re-emit whole)
+
+**1. `packages/brain/src/anomaly.ts` — silence detector crashes** (`max(gap)` is an interval, not a timestamp, so `s.last.getTime()` throws and the detector never runs). Replace `silenceDetector()` with:
+
+```typescript
+async function silenceDetector(): Promise<AnomalyDraft[]> {
+  const rows = await brainDb.$queryRaw<Array<{ source: string; last: Date; p50h: number }>>`
+    WITH gaps AS (
+      SELECT source,
+             EXTRACT(EPOCH FROM (at - lag(at) OVER (PARTITION BY source ORDER BY at))) / 3600 AS gap_h
+      FROM "BrainEvent" WHERE at > now() - interval '7 days'
+    ),
+    med AS (
+      SELECT source, percentile_cont(0.5) WITHIN GROUP (ORDER BY gap_h) AS p50h
+      FROM gaps WHERE gap_h IS NOT NULL GROUP BY source
+      HAVING percentile_cont(0.5) WITHIN GROUP (ORDER BY gap_h) > 0
+    ),
+    lastseen AS (
+      SELECT source, max(at) AS last FROM "BrainEvent" GROUP BY source
+    )
+    SELECT m.source, l.last, m.p50h FROM med m JOIN lastseen l ON l.source = m.source`;
+  return rows
+    .filter((s) => (Date.now() - s.last.getTime()) / 3_600_000 > Number(s.p50h) * 3)
+    .map((s) => ({
+      detector: "silence", subsystem: s.source, metric: "hours_since_last_event",
+      value: Math.round(((Date.now() - s.last.getTime()) / 3_600_000) * 10) / 10,
+      baseline: Math.round(Number(s.p50h) * 10) / 10,
+      severity: "CRITICAL" as const, details: { lastAt: s.last.toISOString() },
+    }));
+}
+```
+
+**2. `packages/questionnaire/src/negative/capture.ts` — embeddings never written.** The `prisma.negativeExample.create(...).catch(raw insert)` pattern only raw-inserts on failure, so `embedding` stays NULL and `guardAutoClone`/vector-negatives are dead. Delete the `.create({...} as never)` call and keep **only** the raw `INSERT ... ::vector` statement (unconditional).
+
+**3. `packages/questionnaire/src/retrieval/calibrate.ts` — broken import.** `normalizeQuestion` is not exported from `./search`. Change to:
+
+```typescript
+import { normalizeQuestion } from "./normalize";
+import { searchAnswerLibrary } from "./search";
+```
+
+**4. `packages/questionnaire/src/retrieval/search.ts` — type/runtime mismatch.** `bm25Scores(queries: string[], ...)` but `tokenize(queries)` expects a string. Change signature to `queries: string`.
+
+**5. `apps/api/src/routes/auditor.ts` — bogus first pass.** `const hash = (...findMany).find((a) => a.tokenHash && verify(...))` uses an async predicate in `.find` (always truthy → matches the *first* active token, unverified). Delete that statement and its `!hash` check; keep only the serial `verify` loop that sets `access`.
+
+**6. `tests/rls/rls.audit.test.ts` — invalid column.** The fixture `INSERT INTO "Control"` includes a `"sequence"` column that doesn't exist. Remove `"sequence"` from the column list and the `1` from the values.
+
+## Step 4 — Boot, verify, push
+
+```bash
+docker compose up -d && pnpm install
+pnpm db:push && pnpm db:push:brain && pnpm db:push:ethics
+pnpm db:rls && pnpm db:vector
+pnpm db:seed && pnpm db:seed:templates && pnpm db:seed:matrix
+pnpm db:seed:sources && pnpm db:seed:prompts
+pnpm test && pnpm audit:rls        # quality gates before first push
+pnpm dev                            # api/web :3000 · brain :3010
+# then: git init -b main, commit, push, tag v0.1.0-alpha (per batch-10 commands)
+```
+
+## Why this gets you to "best in system"
+
+- **Correctness first:** the six patches fix a crashing detector, a dead learning-loop guard, two build breaks, one seed break, and one test break — the difference between "impressive spec" and "actually green CI."
+- **Gates as architecture:** RLS audit (non-superuser), SDK drift CI, k6 morning-burst, and the expert-verification launch gate for `AI_COMPILED` legal content are your differentiators — keep them running in CI from day one.
+- **Honest map:** `docs/ASSEMBLY.md` + `docs/HARDENING.md` tell any reviewer exactly what runs, what's stubbed, and what's next — that transparency *is* the quality signal.
+
+Want me to continue with any of: (a) the demo-org seed script (P1), (b) Playwright e2e for the three screens, or (c) the Redis-backed rate limiter swap?

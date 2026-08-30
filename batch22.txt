@@ -1,0 +1,126 @@
+### FILE: package.json
+```json
+{
+"name": "compliance-platform",
+"private": true,
+"packageManager": "pnpm@9.0.0",
+"workspaces": ["packages/*", "apps/*", "sdks/ts"],
+"scripts": {
+"dev": "turbo run dev",
+"build": "turbo run build",
+"test": "vitest run",
+"db:push": "prisma db push --schema packages/db/prisma/schema.prisma",
+"db:push:brain": "prisma db push --schema packages/brain/prisma/schema.prisma",
+"db:push:ethics": "ETHICS_DATABASE_URL=\"${ETHICS_DATABASE_URL:-postgresql://ethics:ethics@localhost:5433/ethics}\" prisma db push --schema apps/ethics/prisma/schema.prisma",
+"db:vector": "psql \"$DATABASE_URL\" -f packages/db/prisma/vector.sql",
+"db:rls": "psql \"$DATABASE_URL\" -f packages/db/prisma/rls.sql",
+"db:seed": "tsx packages/db/seed/load-seed.ts",
+"db:seed:templates": "tsx packages/core/src/controls/loadTemplates.ts",
+"db:seed:matrix": "tsx packages/core/src/incidents/loadMatrix.ts",
+"db:seed:sources": "tsx packages/knowledge/src/sources/seed.ts && tsx packages/knowledge/src/legislative/sourcePack.ts",
+"db:seed:prompts": "tsx packages/db/seed/prompts.ts",
+"db:seed:demo": "tsx packages/db/seed/demo.ts",
+"audit:rls": "vitest run tests/rls",
+"sdk:generate": "tsx packages/api/src/openapi/generate.ts",
+"load:test": "k6 run tests/load/morningBurst.js"
+},
+"devDependencies": {
+"turbo": "^2.0.0",
+"typescript": "^5.5.0",
+"vitest": "^2.0.0",
+"@types/node": "^22.0.0",
+"pg": "^8.12.0",
+"@types/pg": "^8.11.0"
+}
+}
+```
+### END FILE
+### FILE: pnpm-workspace.yaml
+```yaml
+# REQUIRED — pnpm ignores the "workspaces" field in package.json.
+# Without this file no workspace:* link resolves and pnpm install fails.
+packages:
+  - "packages/*"
+  - "apps/*"
+  - "sdks/ts"
+```
+### END FILE
+### FILE: turbo.json
+```json
+{
+"$schema": "https://turbo.build/schema.json",
+"tasks": {
+"build": { "dependsOn": ["^build"], "outputs": [".next/**", "!.next/cache/**", "dist/**"] },
+"dev": { "cache": false, "persistent": true },
+"test": { "dependsOn": [] }
+}
+}
+```
+### END FILE
+### FILE: .env.example
+```bash
+# ── core ──
+DATABASE_URL=postgresql://app:app@localhost:5432/compliance
+REDIS_URL=redis://localhost:6379
+TEMPORAL_ADDRESS=localhost:7233
+PORT=3000
+BRAIN_PORT=3010
+APP_DOMAIN=localhost:3000
+SESSION_SECRET=dev-only-change-me
+# ── LLM (optional at boot — clients are lazy; only AI calls need keys) ──
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+LLM_PRIMARY=anthropic
+# ── ethics (isolated service) ──
+ETHICS_DATABASE_URL=postgresql://ethics:ethics@localhost:5433/ethics
+ETHICS_EVENT_HMAC_SECRET=dev-hmac-secret
+ETHICS_INVESTIGATOR_TOKEN=dev-investigator-token
+ETHICS_PORT=3002
+# ── AWS (KMS envelope encryption + S3) — needed for real credential storage ──
+AWS_REGION=us-east-1
+AWS_KMS_MAIN_KEY_ID=alias/compliance-main
+AWS_KMS_ETHICS_KEY_ID=alias/compliance-ethics
+S3_EVIDENCE_BUCKET=compliance-evidence
+# ── web ──
+NEXT_PUBLIC_API_URL=
+```
+### END FILE
+### FILE: docker-compose.yml
+```yaml
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: compliance }
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U app -d compliance"], interval: 5s, timeout: 3s, retries: 30 }
+  postgres-ethics:
+    image: postgres:16
+    environment: { POSTGRES_USER: ethics, POSTGRES_PASSWORD: ethics, POSTGRES_DB: ethics }
+    ports: ["5433:5432"]
+    volumes: [pgethics:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U ethics -d ethics"], interval: 5s, timeout: 3s, retries: 30 }
+  temporal:
+    image: temporalio/auto-setup:1.24
+    ports: ["7233:7233"]
+    environment: { DB: postgres12, POSTGRES_SEEDS: postgres, POSTGRES_USER: app, POSTGRES_PWD: app }
+    depends_on: { postgres: { condition: service_healthy } }
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 30 }
+volumes: { pgdata: {}, pgethics: {} }
+```
+### END FILE
+### FILE: .gitignore
+```
+node_modules/
+.next/
+dist/
+.env
+.env.local
+.dev.log
+*.tsbuildinfo
+.turbo/
+```
+### END FILE

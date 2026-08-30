@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Compliance — AI-First Ethics &amp; Compliance Platform (full)</title>
+<style>
+:root{--surface:#fafafa;--muted:#f4f4f5;--muted2:#e4e4e7;--mfg:#71717a;--border:#e4e4e7;
+--pass:#16a34a;--fail:#dc2626;--warn:#d97706;--info:#2563eb;--draft:#a16207;--accent:#4f46e5}
+*{box-sizing:border-box;margin:0;padding:0}html{font-size:13px}
+body{font:13px/1.55 Inter,-apple-system,"Segoe UI",system-ui,sans-serif;background:#fff;color:#18181b;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}button{font:inherit;cursor:pointer;border:none;background:none;color:inherit}
+.tabular{font-variant-numeric:tabular-nums}.mono{font-family:ui-monospace,Menlo,monospace;font-size:11px}
+.shell{display:flex;min-height:100vh}
+.sidebar{width:230px;flex-shrink:0;border-right:1px solid var(--border);position:sticky;top:0;height:100vh;display:flex;flex-direction:column;background:#fff}
+.logo{height:52px;display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--border);padding:0 16px;font-weight:650;font-size:15px}
+.logo .hex{width:28px;height:28px;border-radius:8px;background:var(--accent);display:grid;place-items:center;color:#fff}
+.logo .v{margin-left:auto;border:1px solid var(--border);background:var(--muted);border-radius:99px;padding:1px 9px;font-size:11px;color:var(--mfg);font-weight:500}
+.nav{flex:1;overflow-y:auto;padding:8px 10px 16px}
+.ng{margin-top:12px}.nl{font-size:10px;font-weight:650;text-transform:uppercase;letter-spacing:.09em;color:var(--mfg);padding:0 9px 5px}
+.nav a{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:8px;color:#52525b;margin-bottom:1px;font-size:13.5px}
+.nav a:hover{background:var(--muted)}.nav a.active{background:var(--muted2);color:#18181b;font-weight:550}
+.nav .ic{width:18px;text-align:center;flex-shrink:0}.nav .bdg{margin-left:auto;background:var(--accent);color:#fff;border-radius:99px;padding:0 7px;font-size:10.5px;font-weight:600}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{height:50px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;padding:0 20px;position:sticky;top:0;background:#ffffffd9;backdrop-filter:blur(8px);z-index:20}
+.search{flex:1;max-width:300px;display:flex;align-items:center;gap:8px;background:var(--muted);border:1px solid var(--border);border-radius:8px;padding:6px 11px;color:var(--mfg)}
+.topbar .sp{flex:1}.avatar{width:30px;height:30px;border-radius:50%;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:11px;font-weight:650}
+.content{padding:20px;max-width:1240px;width:100%;margin:0 auto}
+h1{font-size:16px;font-weight:650;letter-spacing:-.01em}h2{font-size:14px;font-weight:600}
+.phead{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.psub{color:var(--mfg);font-size:12px;margin-top:2px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.ctitle{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);padding:10px 14px;font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.07em;color:var(--mfg)}
+.cbody{padding:14px}
+.grid{display:grid;gap:12px}.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:repeat(3,1fr)}.g4{grid-template-columns:repeat(4,1fr)}.gmain{grid-template-columns:1fr 340px}
+@media(max-width:1000px){.g2,.g3,.g4,.gmain{grid-template-columns:1fr}}
+.badge{display:inline-flex;align-items:center;gap:4px;border:1px solid;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:550}
+.b-pass{color:var(--pass);background:#16a34a1a;border-color:#16a34a4d}.b-fail{color:var(--fail);background:#dc26261a;border-color:#dc26264d}
+.b-warn{color:var(--warn);background:#d977061a;border-color:#d977064d}.b-info{color:var(--info);background:#2563eb1a;border-color:#2563eb4d}
+.b-draft{color:var(--draft);background:#a162071a;border-color:#a1620766;border-style:dashed}.b-zinc{color:var(--mfg);background:var(--muted);border-color:var(--border)}
+.btn{display:inline-flex;align-items:center;gap:6px;height:31px;border-radius:7px;padding:0 12px;font-weight:550;font-size:12.5px;border:1px solid transparent}
+.btn:disabled{opacity:.4;pointer-events:none}
+.btn-p{background:#18181b;color:#fff}.btn-o{border-color:var(--border);background:#fff}.btn-o:hover{background:var(--muted)}
+.btn-s{background:#16a34a1a;color:var(--pass);border-color:#16a34a4d}.btn-d{background:#dc26261a;color:var(--fail);border-color:#dc26264d}
+.muted{color:var(--mfg)}.sm{font-size:12px}.xs{font-size:11px}
+.ring{position:relative;display:inline-grid;place-items:center}.ring svg{transform:rotate(-90deg)}
+.ring .ctr{position:absolute;text-align:center}.ring .ctr b{font-size:19px;font-weight:650;display:block}.ring .ctr span{font-size:10px;color:var(--mfg)}
+.frow{display:flex;gap:9px;align-items:flex-start;padding:7px 14px;border-bottom:1px solid var(--border);font-size:12px}.frow:last-child{border-bottom:none}.frow .t{color:var(--mfg);width:42px;flex-shrink:0}
+.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tbl th{text-align:left;font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.07em;color:var(--mfg);padding:8px 14px;border-bottom:1px solid var(--border)}
+.tbl td{padding:9px 14px;border-bottom:1px solid var(--border);vertical-align:middle}.tbl tr:last-child td{border-bottom:none}.tbl tr:hover td{background:#fafafa}
+.row{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--border)}.row:last-child{border-bottom:none}.row:hover{background:#fafafa}
+.chain{border:1px solid var(--border);border-left:4px solid var(--pass);border-radius:8px;background:#fff;margin-bottom:6px}
+.chain.f{border-left-color:var(--fail)}
+.chead{display:flex;align-items:center;gap:9px;padding:8px 12px;width:100%;text-align:left;cursor:pointer}
+.clink{display:flex;align-items:center;gap:7px;padding:2px 0 2px 18px;font-size:10.5px;color:var(--mfg)}
+.qbar{display:flex;align-items:center;gap:9px;font-size:12px;margin-bottom:8px}.qbar .tr{flex:1;height:8px;background:var(--muted);border-radius:99px;overflow:hidden}.qbar .fl{height:100%;border-radius:99px}
+.subsys{display:flex;align-items:center;gap:10px;font-size:12px;padding:7px 0;border-bottom:1px solid var(--border)}.subsys:last-child{border-bottom:none}
+.subsys .tr{flex:1;height:6px;background:var(--muted);border-radius:99px;overflow:hidden}.subsys .fl{height:100%;border-radius:99px}
+.steps{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:10px 0}.stp{border-radius:6px;padding:2px 8px;font-size:10.5px;font-weight:600}
+.stp.on{background:#2563eb1a;color:var(--info)}.stp.off{background:var(--muted);color:var(--mfg)}
+.loopstep{display:flex;align-items:center;gap:8px;padding:6px 0;font-size:12px}.loopstep .n{width:20px;height:20px;border-radius:50%;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:10px;flex-shrink:0}
+.overlay{position:fixed;inset:0;background:#0006;display:flex;align-items:flex-start;justify-content:center;padding:16px;padding-top:8vh;z-index:50;backdrop-filter:blur(2px)}
+.modal{background:#fff;border:1px solid var(--border);border-radius:12px;width:100%;max-width:560px;box-shadow:0 20px 50px #0003;max-height:86vh;overflow-y:auto}
+.modal .mh{border-bottom:1px solid var(--border);padding:12px 16px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+.modal .mb{padding:16px}
+.kbd{border:1px solid var(--border);background:var(--muted);border-radius:4px;padding:0 5px;font-size:10px;color:var(--mfg)}
+.pulse{animation:pu 1.8s infinite}@keyframes pu{0%,100%{opacity:1}50%{opacity:.35}}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.clock{font-family:ui-monospace,monospace;font-weight:650;font-size:14px}.clock.crit{color:var(--fail);animation:pu 1.4s infinite}.clock.wr{color:var(--warn)}
+.wm{position:relative}.wm::after{content:attr(data-wm);position:absolute;bottom:8px;right:12px;font:10px monospace;color:var(--mfg);opacity:.6}
+input,textarea,select{font:inherit;border:1px solid var(--border);border-radius:8px;padding:7px 10px;width:100%;background:#fff}
+label.f{display:block;font-size:12px;font-weight:550;margin:10px 0 4px;color:#52525b}
+.empty{padding:30px;text-align:center;color:var(--mfg)}
+</style>
+</head>
+<body>
+<div class="shell">
+<aside class="sidebar">
+<div class="logo"><span class="hex">⬢</span> Compliance <span class="v">v2</span></div>
+<nav class="nav" id="nav"></nav>
+</aside>
+<div class="main">
+<div class="topbar"><div class="search">🔍 <span>Search…</span></div><div class="sp"></div><span class="xs muted">Acme Corp</span><div class="avatar">SC</div></div>
+<div class="content" id="view"></div>
+</div>
+</div>
+<div id="modalRoot"></div>
+<script>
+/* ══ helpers ══ */
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const rhex=()=>Math.random().toString(16).slice(2,10);
+const dstr=d=>new Date(d).toLocaleDateString([],{month:"short",day:"numeric"});
+/* ══ data (mirrors the real system) ══ */
+const FW={SOC2:{pct:87,t:46,d:40,n:"SOC 2"},ISO27001:{pct:74,t:93,d:69,n:"ISO 27001"},HIPAA:{pct:81,t:42,d:34,n:"HIPAA"},GDPR:{pct:68,t:25,d:17,n:"GDPR"}};
+const CONTROLS=[
+{slug:"access.adminMfa",name:"MFA for Privileged Accounts",state:"PASSING",grade:"A",score:96,reqs:[["S2","CC6.1"],["ISO","8.5"],["HIP","164.312(d)"],["GDPR","Art.32"]]},
+{slug:"access.offboarding",name:"Offboarding Within 24 Hours",state:"FAILING",grade:"C",score:58,reqs:[["S2","CC6.2"],["ISO","5.11"],["HIP","164.308(a)(2)(ii)(C)"]]},
+{slug:"crypto.atRest",name:"Encryption at Rest",state:"PASSING",grade:"A",score:94,reqs:[["S2","CC6.1"],["ISO","8.24"],["HIP","164.312(a)(2)(iv)"]]},
+{slug:"change.branchProtection",name:"Protected Mainline & Code Review",state:"PASSING",grade:"B",score:82,reqs:[["S2","CC8.1"],["ISO","8.32"]]},
+{slug:"vendor.riskProgram",name:"Vendor Risk Management",state:"STALE",grade:"D",score:44,reqs:[["S2","CC9.2"],["ISO","5.19"],["GDPR","Art.28"]]}];
+function mkChain(slug,n,failAt){const o=[];for(let i=1;i<=n;i++)o.push({seq:i,status:failAt===i?"FAIL":"PASS",ch:rhex(),at:Date.now()-i*2*864e5});return o.reverse()}
+const CHAINS={"access.adminMfa":mkChain("a",5),"access.offboarding":mkChain("b",4,1),"crypto.atRest":mkChain("c",6),"change.branchProtection":mkChain("d",3),"vendor.riskProgram":mkChain("e",2)};
+let TASKS=[
+{t:"Deprovision terminated employees immediately",p:"CRITICAL",s:"OPEN",src:"test",reopened:true},
+{t:"Verify EU subject facts for GDPR Art.33 clock",p:"HIGH",s:"OPEN",src:"incident"},
+{t:"Evidence quality below gate: vendor.riskProgram",p:"HIGH",s:"OPEN",src:"gap"},
+{t:"Stripe annual vendor review",p:"MEDIUM",s:"IN_PROGRESS",src:"vendor"},
+{t:"Rotate Okta API token",p:"MEDIUM",s:"DONE",src:"manual",verifying:true},
+{t:"Upload Q2 access-review evidence",p:"MEDIUM",s:"DONE",src:"gap"}];
+const POLICIES=[
+{t:"Access Control Policy",v:3,st:"APPROVED",ai:false,cc:"MATERIAL",acks:"118/120"},
+{t:"Information Security Policy",v:1,st:"IN_REVIEW",ai:true,cc:"—",acks:"—"},
+{t:"Encryption Policy",v:2,st:"APPROVED",ai:false,cc:"EDITORIAL",acks:"120/120"},
+{t:"Incident Response Plan",v:2,st:"APPROVED",ai:false,cc:"MATERIAL",acks:"117/120"},
+{t:"Privacy Policy",v:1,st:"IN_REVIEW",ai:true,cc:"—",acks:"—"}];
+const VENDORS=[
+{n:"Stripe",tier:"CRITICAL",score:88,cert:"SOC2 exp 28d",cad:"6mo"},
+{n:"Datadog",tier:"HIGH",score:61,cert:"ISO expired",cad:"12mo"},
+{n:"Acme Legal LLP",tier:"LOW",score:74,cert:"—",cad:"24mo"}];
+let DSARS=[
+{type:"ACCESS",st:"VERIFIED",due:"+12d"},{type:"ERASE",st:"VERIFYING",due:"+28d"},
+{type:"ACCESS",st:"REVIEW",due:"+3d"},{type:"PORT",st:"DELIVERED",due:"+5d"},
+{type:"ACCESS",st:"REVIEW",due:"OVERDUE",over:true}];
+const RADAR=[
+{j:"US-CO",sum:"SB 24-10 amends breach deadline 30d → 21d (biometric)",st:"PENDING_REVIEW"},
+{j:"EU",sum:"EDPB guidance on Art.33 'without undue delay'",st:"VERIFIED"},
+{j:"US-NY",sum:"DFS Part 500 amendment — 72h threshold lowered",st:"APPLIED"}];
+const REVIEWQ=[
+{q:"FRAMEWORK_CONTENT",t:"SOC2 CC7.4 — Incident response",p:"HIGH",cred:"CIPA",st:"PENDING"},
+{q:"MATRIX_PROPOSAL",t:"US-CO: SB 24-10 amends breach rule",p:"CRITICAL",cred:"LEGAL_US_STATES",st:"PENDING"},
+{q:"REG_CHANGE",t:"US-NY: DFS Part 500 72h threshold",p:"HIGH",cred:"CIPA",st:"CLAIMED"},
+{q:"RIA_DRIFT",t:"RIA extraction drift: rejection_rate_7d = 0.34",p:"CRITICAL",cred:"—",st:"PENDING"}];
+const SUBSYS={api:.99,mcp:1,connectors:.92,check_runner:.97,llm:1,temporal:1,sla_timers:.98,review_queue:.95,ethics_service:1};
+const RIA_DRIFT=[
+{m:"rejection_rate_7d",v:.34,b:.15,sev:"CRITICAL",inc:"inc-ria-1"},
+{m:"retrieval_precision",v:.88,b:.92,sev:"WARN",inc:null}];
+const QUEST=[
+{q:"Is MFA required for administrative access?",st:"AUTO_DRAFTED",c:.96,a:"Yes. All administrative and privileged accounts enforce MFA, verified daily against Okta (12/12 enrolled)."},
+{q:"How long do you retain audit logs?",st:"AUTO_DRAFTED",c:.91,a:"Audit logs retained 12 months; 90 days immediately queryable."},
+{q:"Where is customer data stored geographically?",st:"AI_DRAFTED",c:.42,a:null},
+{q:"Describe your incident response process.",st:"STALE",c:.88,a:"Seven-state machine; per-jurisdiction notification deadlines."}];
+/* ══ nav ══ */
+const NAV=[
+{g:"Overview",i:[["#/","Home","▣"],["#/brain","The Brain","⬢"]]},
+{g:"Compliance",i:[["#/controls","Controls","◇"],["#/tasks","Tasks","✓",7],["#/policies","Policies","▤"],["#/questionnaires","Questionnaires","▦",32]]},
+{g:"Operations",i:[["#/vendors","Vendors","⌂"],["#/privacy","Privacy / DSAR","≣"],["#/incidents","Incidents","⚠",1],["#/radar","Reg Radar","📡"]]},
+{g:"Platform",i:[["#/trust","Trust Center","🛡"],["#/onboarding","Onboarding","◈"],["#/settings","Settings","⚙"]]},
+{g:"Governance",i:[["#/review","Review Console","🔍",4],["#/auditor","Auditor Portal","📋"],["#/ethics","Ethics Hotline","🕊"]]},
+{g:"Tools",i:[["#/calculator","SOC 2 Calculator","🧮"],["#/report","Executive Report","📊"]]}];
+document.getElementById("nav").innerHTML=NAV.map(g=>`<div class="ng"><div class="nl">${g.g}</div>${g.i.map(x=>`<a href="${x[0]}" data-h="${x[0]}"><span class="ic">${x[2]}</span><span style="flex:1">${x[1]}</span>${x[3]?`<span class="bdg">${x[3]}</span>`:""}</a>`).join("")}</div>`).join("");
+/* ══ shared bits ══ */
+const ring=(p,s=112)=>{const r=s/2-9,c=2*Math.PI*r,col=p>=80?"var(--pass)":p>=50?"var(--warn)":"var(--fail)";return `<div class="ring" style="width:${s}px;height:${s}px"><svg width="${s}" height="${s}"><circle cx="${s/2}" cy="${s/2}" r="${r}" stroke="var(--muted2)" stroke-width="9" fill="none"/><circle cx="${s/2}" cy="${s/2}" r="${r}" stroke="${col}" stroke-width="9" fill="none" stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${c*(1-p/100)}"/></svg><div class="ctr"><b>${p}%</b></div></div>`};
+const badge=(t,txt)=>`<span class="badge ${t}">${txt}</span>`;
+const STONE={PASSING:"b-pass",FAILING:"b-fail",STALE:"b-warn",DEGRADED:"b-warn"};
+const PTONE={CRITICAL:"b-fail",HIGH:"b-warn",MEDIUM:"b-info",LOW:"b-zinc"};
+/* ══ router ══ */
+const view=document.getElementById("view");
+function go(){const h=location.hash||"#/";
+document.querySelectorAll("#nav a").forEach(a=>a.classList.toggle("active",a.dataset.h===h));
+const R={"#/":home,"#/brain":brain,"#/controls":controls,"#/tasks":tasks,"#/policies":policies,"#/questionnaires":questionnaires,"#/vendors":vendors,"#/privacy":privacy,"#/incidents":incidents,"#/radar":radar,"#/trust":trust,"#/onboarding":onboarding,"#/settings":settings,"#/review":review,"#/auditor":auditor,"#/ethics":ethics,"#/calculator":calculator,"#/report":report};
+(R[h]||home)();}
+window.addEventListener("hashchange",go);
+/* ══ screens ══ */
+function home(){view.innerHTML=`<div class="phead"><div><h1>Good morning, Sarah</h1><div class="psub">${new Date().toDateString()}</div></div><span class="badge b-pass"><span class="dot pulse" style="background:var(--pass)"></span> Brain live</span></div>
+<div class="grid g4" style="margin-bottom:12px">${Object.values(FW).map(f=>`<div class="card" style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:16px">${ring(f.pct)}<div style="text-align:center"><div style="font-weight:550">${f.n}</div><div class="xs muted">${f.d}/${f.t} satisfied</div></div>${f.pct<75?badge("b-warn",(f.t-f.d)+" gaps"):""}</div>`).join("")}</div>
+<div class="grid gmain"><div class="grid g3" style="align-content:start">
+<div class="card cbody"><div class="xs muted" style="font-weight:650;text-transform:uppercase;margin-bottom:8px">Evidence quality</div>${[["A",62,"var(--pass)"],["B",28,"var(--pass)"],["C",7,"var(--warn)"],["D",2,"var(--warn)"],["F",1,"var(--fail)"]].map(([g,n,c])=>`<div class="qbar"><span style="width:12px;font-weight:650">${g}</span><div class="tr"><div class="fl" style="width:${n}%;background:${c}"></div></div><span class="muted tabular" style="width:24px;text-align:right">${n}</span></div>`).join("")}</div>
+<div class="card cbody"><div class="xs muted" style="font-weight:650;text-transform:uppercase;margin-bottom:8px">Tasks</div>${[["Critical",3],["High",5],["Medium",9],["Low",4]].map(([l,n])=>`<div class="qbar"><span style="flex:1">${l}</span><b class="tabular">${n}</b></div>`).join("")}<a href="#/tasks" class="sm" style="color:var(--info)">Open tasks →</a></div>
+<div class="card cbody"><div class="xs muted" style="font-weight:650;text-transform:uppercase;margin-bottom:8px">Reg radar</div>${RADAR.map(r=>`<div class="sm" style="margin-bottom:7px"><span class="muted xs">${r.j} · </span>${esc(r.sum.slice(0,44))}…</div>`).join("")}<a href="#/radar" class="sm" style="color:var(--info)">All changes →</a></div>
+</div>
+<div class="card"><div class="ctitle">Live activity <span class="xs muted">streaming</span></div><div id="feed" style="max-height:380px;overflow-y:auto"></div></div></div>`;
+const pool=[["control.test.passed","✅"],["control.test.failed","❌"],["evidence.created","🧾"],["gap.detected","⚠️"],["regchange.applied","📡"],["trust.nda.signed","🛡"]];
+let feed=[];const push=()=>{const[t,i]=pool[Math.floor(Math.random()*pool.length)];feed.unshift({t,i,at:new Date()});feed=feed.slice(0,30);const el=document.getElementById("feed");if(el)el.innerHTML=feed.map(e=>`<div class="frow"><span class="t">${new Date(e.at).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}</span><span>${e.i}</span><span style="flex:1">${e.t}</span></div>`).join("")};
+for(let i=0;i<8;i++)push();setInterval(push,3500);}
+function brain(){const comp=Math.round((Math.min(...Object.values(SUBSYS))*.6+Object.values(SUBSYS).reduce((a,b)=>a+b,0)/9*.4)*100)/100;
+view.innerHTML=`<div class="phead"><h1>The Brain — RIA drift wired to incidents</h1><span class="badge ${comp>=.9?"b-pass":"b-warn"}">composite ${(comp*100).toFixed(0)}%</span></div>
+<div class="grid gmain"><div>
+<div class="card" style="margin-bottom:12px"><div class="ctitle">Subsystem health (9)</div><div class="cbody">${Object.entries(SUBSYS).map(([k,v])=>`<div class="subsys"><span style="width:104px;color:#52525b">${k.replace(/_/g," ")}</span><div class="tr"><div class="fl" style="width:${v*100}%;background:${v>=.95?"var(--pass)":v>=.6?"var(--warn)":"var(--fail)"}"></div></div><span class="muted tabular" style="width:36px;text-align:right">${Math.round(v*100)}%</span></div>`).join("")}</div></div>
+<div class="card"><div class="ctitle">RIA drift anomalies <span class="badge b-fail">1 critical</span></div><div class="cbody">${RIA_DRIFT.map(d=>`<div style="border:1px solid var(--border);border-left:4px solid ${d.sev==="CRITICAL"?"var(--fail)":"var(--warn)"};border-radius:8px;padding:10px 12px;margin-bottom:8px"><div style="display:flex;gap:8px;align-items:center">${badge(d.sev==="CRITICAL"?"b-fail":"b-warn",d.sev)}<b>${d.m}</b><span class="xs muted">value ${d.v} vs baseline ${d.b}</span></div>${d.inc?`<div class="xs muted" style="margin-top:5px">→ BrainIncident ${d.inc} opened + ReviewItem (RIA_DRIFT) enqueued — loop closed</div>`:`<div class="xs muted" style="margin-top:5px">anomaly only (WARN)</div>`}</div>`).join("")}</div></div>
+<div><div class="card"><div class="ctitle">The closed loop</div><div class="cbody">${[["1","MONITOR — riaDriftDetector reads learning signals"],["2","REFLEX — Brain opens incident + pages"],["3","REFLEX — enqueues RIA_DRIFT review item"],["4","REVIEW — expert approve→recalibrate / reject→FALSE_POSITIVE"]].map(s=>`<div class="loopstep"><span class="n">${s[0]}</span><div>${s[1]}</div></div>`).join("")}</div></div>
+<div class="card" style="margin-top:12px"><div class="ctitle">ask_brain</div><div class="cbody"><div class="sm muted" style="margin-bottom:6px">› why did connector syncs fail overnight?</div><div class="sm">Ranked hypothesis: Okta token expired 04:12Z (evt-…, evt-… show 401 burst). Rotate token; disconfirm if syncs resume without change.</div></div></div></div></div>`;}
+function controls(){view.innerHTML=`<div class="phead"><h1>Controls</h1><span class="xs muted">one control → four frameworks</span></div>
+<div class="card"><table class="tbl"><thead><tr><th>Control</th><th>Frameworks</th><th>Test</th><th>Grade</th><th></th></tr></thead><tbody>
+${CONTROLS.map(c=>`<tr><td style="font-weight:550">${c.name}</td><td>${c.reqs.map(r=>`<span class="badge b-zinc" style="margin-right:3px">${r[0]} ${r[1]}</span>`).join("")}</td><td>${badge(STONE[c.state],c.state)}</td><td>${badge(c.score>=75?"b-pass":c.score>=50?"b-warn":"b-fail",c.grade)}</td><td><button class="btn btn-o" onclick="openControl('${c.slug}')">Open</button></td></tr>`).join("")}</tbody></table></div>`;}
+window.openControl=slug=>{const c=CONTROLS.find(x=>x.slug===slug),ch=CHAINS[slug]||[];
+document.getElementById("modalRoot").innerHTML=`<div class="overlay" onclick="if(event.target===this)closeM()"><div class="modal" style="max-width:640px"><div class="mh"><span>${c.name}</span><button class="btn btn-o" onclick="closeM()">✕</button></div><div class="mb">
+<div style="display:flex;gap:6px;margin-bottom:10px">${badge(STONE[c.state],"test: "+c.state)}${badge("b-pass","quality "+c.score)}</div>
+<div class="xs muted" style="font-weight:650;text-transform:uppercase;margin-bottom:8px">Evidence chain — tamper-evident</div>
+${ch.map((e,i)=>`${i>0?`<div class="clink">sha256(${ch[i-1].ch}… ‖ content) ▼</div>`:""}<div class="chain ${e.status==="FAIL"?"f":""}"><div class="chead"><span class="mono" style="color:${e.status==="PASS"?"var(--pass)":"var(--fail)"}">${e.status==="PASS"?"✓":"✗"}</span><span class="muted tabular">#${e.seq}</span><span style="flex:1">Scheduled evidence run</span><span class="mono muted">chain ${e.ch}…</span></div></div>`).join("")}
+<div style="display:flex;gap:8px;margin-top:10px"><button class="btn btn-o" onclick="this.textContent='verified ✓ '+${ch.length}+' links'">Verify chain 🔒</button><button class="btn btn-p" onclick="this.textContent='Running…'">Run test now</button></div>
+</div></div></div>`;};
+window.closeM=()=>document.getElementById("modalRoot").innerHTML="";
+function tasks(){view.innerHTML=`<div class="phead"><h1>Tasks</h1><span class="xs muted">auto-verify sweep hourly</span></div>
+<div class="card"><div class="ctitle">Open</div>${TASKS.filter(t=>t.s!=="DONE").map(t=>`<div class="row">${badge(PTONE[t.p],t.p)}<div style="flex:1"><div style="font-weight:550">${t.t}</div><div class="xs muted">${t.src}${t.reopened?' <span style="color:var(--fail)">⚠ auto-verify failed — reopened</span>':""}</div></div><button class="btn btn-s" onclick="this.textContent='done ✓'">Mark done</button></div>`).join("")}</div>
+<div class="card" style="margin-top:12px"><div class="ctitle">Completed — auto-verification</div>${TASKS.filter(t=>t.s==="DONE").map(t=>`<div class="row"><span style="color:var(--pass)">✓</span><div style="flex:1">${t.t}</div>${t.verifying?badge("b-warn","⏳ auto-verifying"):badge("b-pass","verified")}</div>`).join("")}</div>`;}
+function policies(){view.innerHTML=`<div class="phead"><h1>Policies — AI generation & versioning</h1><button class="btn btn-p" onclick="this.textContent='draft queued (IN_REVIEW)'">+ Draft policy (AI)</button></div>
+<div class="card"><table class="tbl"><thead><tr><th>Policy</th><th>v</th><th>Status</th><th>Change class</th><th>Acks</th></tr></thead><tbody>
+${POLICIES.map(p=>`<tr><td style="font-weight:550">${p.t} ${p.ai?badge("b-draft","AI draft"):""}</td><td class="tabular">v${p.v}</td><td>${badge(p.st==="APPROVED"?"b-pass":"b-warn",p.st)}</td><td class="xs muted">${p.cc}${p.cc==="MATERIAL"?" → re-ack":""}</td><td class="xs tabular">${p.acks}</td></tr>`).join("")}</tbody></table></div>
+<div class="xs muted" style="margin-top:10px">AI drafts land IN_REVIEW and never auto-publish. MATERIAL changes reset acknowledgments; EDITORIAL carry forward. Coverage gate blocks publishing that orphans mapped requirements.</div>`;}
+function questionnaires(){view.innerHTML=`<div class="phead"><h1>Questionnaires — Northwind Bank</h1><span class="badge b-info">library coverage 71%</span></div>
+<div class="card"><div class="ctitle">Review queue <span class="xs muted">keys: J/K nav · A approve · R reject · B bulk</span></div>
+${QUEST.map((q,i)=>`<div class="row"><span class="muted tabular" style="width:34px">${q.c?.toFixed(2)??"—"}</span><div style="flex:1"><div style="font-weight:550">${q.q}</div>${q.a?`<div class="xs muted" style="margin-top:2px">${esc(q.a.slice(0,80))}…</div>`:`<div class="xs muted">No draft — compose from sources</div>`}</div>${badge(q.st==="AUTO_DRAFTED"?"b-pass":q.st==="STALE"?"b-zinc":q.c<0.7?"b-fail":"b-warn",q.st)}</div>`).join("")}</div>
+<div class="xs muted" style="margin-top:10px">Approve → saved to library (flywheel). Reject → negative example → learned conflict rules + eval-gated prompt promotion. Bulk-approve only ≥0.9.</div>`;}
+function vendors(){view.innerHTML=`<div class="phead"><h1>Vendor risk management</h1><button class="btn btn-p">+ Add vendor</button></div>
+<div class="card"><table class="tbl"><thead><tr><th>Vendor</th><th>Tier</th><th>Posture</th><th>Cert</th><th>Cadence</th></tr></thead><tbody>
+${VENDORS.map(v=>`<tr><td style="font-weight:550">${v.n}</td><td>${badge(v.tier==="CRITICAL"?"b-fail":v.tier==="HIGH"?"b-warn":"b-zinc",v.tier)}</td><td class="tabular">${v.score}</td><td class="xs ${/expir|expired/.test(v.cert)?"":"muted"}" style="${/expired/.test(v.cert)?"color:var(--fail)":/exp/.test(v.cert)?"color:var(--warn)":""}">${v.cert}</td><td class="xs muted">${v.cad}</td></tr>`).join("")}</tbody></table></div>`;}
+function privacy(){view.innerHTML=`<div class="phead"><h1>Privacy / DSAR — GDPR workflows</h1><span class="xs muted">Art.12: 1 month + 2 max</span></div>
+${DSARS.some(d=>d.over)?`<div class="card" style="border-color:#dc26264d;background:#dc26260d;padding:10px 14px;margin-bottom:12px;color:var(--fail);font-size:12px">⚠ 1 request past statutory deadline.</div>`:""}
+<div class="card"><div class="ctitle">DSAR inbox</div>${DSARS.map(d=>`<div class="row">${badge(d.st==="DELIVERED"?"b-pass":d.st==="REVIEW"?"b-warn":"b-zinc",d.st)}<span style="width:64px;font-weight:550">${d.type}</span><div style="flex:1"></div><span class="tabular xs" style="${d.over?"color:var(--fail);font-weight:650":"color:var(--mfg)"}">${d.due}</span></div>`).join("")}</div>
+<div class="grid g3" style="margin-top:12px"><div class="card cbody"><b>RoPA</b><div class="xs muted">Art.30 records generated from data map · v3 DRAFT</div></div><div class="card cbody"><b>DPIA</b><div class="xs muted">2 in progress · 0 high-risk flagged</div></div><div class="card cbody"><b>Drills</b><div class="xs muted">Last synthetic DSAR: PASS · 3/3 systems</div></div></div>`;}
+function incidents(){const ob=[["GDPR_DPA","GDPR Art.33","41:12:05",1],["AG_US-CO","C.R.S. § 6-1-716","29d 04h",0],["HHS","HIPAA 164.408","59d 22h",0]];
+view.innerHTML=`<div class="phead"><h1>Incidents — credential stuffing</h1>${badge("b-fail","HIGH")}</div>
+<div class="card cbody"><div class="xs muted" style="font-weight:650;text-transform:uppercase;margin-bottom:8px">IR state machine</div><div class="steps">${["OPEN","TRIAGE","CONTAINED","ERADICATED","RECOVERED","POSTMORTEM","CLOSED"].map((s,i)=>`<span class="stp ${i<=1?"on":"off"}">${s}</span>${i<6?'<span class="muted">→</span>':""}`).join("")}</div></div>
+<div class="card" style="margin-top:12px"><div class="ctitle">Statutory notification clocks</div>${ob.map(o=>`<div class="row"><div style="flex:1"><div style="font-weight:550">${o[0]}</div><div class="xs muted">${o[1]}</div></div><span class="clock ${o[3]?"crit":""}">${o[2]}</span>${badge("b-warn","PENDING")}</div>`).join("")}</div>`;}
+function radar(){view.innerHTML=`<div class="phead"><h1>Regulatory change radar</h1><span class="xs muted">expert-gated application</span></div>
+<div class="card">${RADAR.map(r=>`<div class="row"><span class="badge b-zinc">${r.j}</span><div style="flex:1">${esc(r.sum)}</div>${badge(r.st==="APPLIED"?"b-pass":r.st==="VERIFIED"?"b-info":"b-warn",r.st)}</div>`).join("")}</div>
+<div class="xs muted" style="margin-top:10px">Federal Register + LegiScan → diff gate → extraction → impact grading → review console. Approved matrix amendments recompute open-incident deadlines immediately.</div>`;}
+function trust(){view.innerHTML=`<div class="phead"><h1>Trust Center / acme</h1><button class="btn btn-p" onclick="alert('Business domain → AUTO_APPROVED → NDA sign → gated docs')">Request access →</button></div>
+<div class="card"><div class="ctitle">Documents</div><div class="row">📄<span style="flex:1">Security Overview (public)</span>${badge("b-pass","public")}</div><div class="row">🔒<span style="flex:1">SOC 2 Type II Report (NDA)</span>${badge("b-zinc","NDA required")}</div></div>
+<div class="xs muted" style="margin-top:10px">Disposable emails blocked · free providers → manual review · business domains auto-approve to NDA signature · gated docs via TTL presigned URLs, views logged.</div>`;}
+function onboarding(){view.innerHTML=`<div class="phead"><h1>Onboarding</h1></div>
+<div class="card cbody" style="max-width:520px;margin:0 auto;text-align:center"><div style="font-size:30px">🎉</div><b style="display:block;margin-top:8px">Your compliance program is live</b>
+<div class="grid g3" style="margin-top:16px"><div><div class="tabular" style="font-size:22px;font-weight:650">14</div><div class="xs muted">controls</div></div><div><div class="tabular" style="font-size:22px;font-weight:650">7</div><div class="xs muted">checks</div></div><div><div class="tabular" style="font-size:22px;font-weight:650">9.8×</div><div class="xs muted">reqs/control</div></div></div></div>`;}
+function settings(){view.innerHTML=`<div class="phead"><h1>Settings</h1></div>
+<div class="grid g2"><div class="card"><div class="ctitle">Organization</div><div class="cbody sm">${[["Name","Acme Corp"],["Industry","SAAS"],["HQ","US"],["Headcount","120"],["Members","5"]].map(r=>`<div class="qbar"><span style="flex:1" class="muted">${r[0]}</span><b>${r[1]}</b></div>`).join("")}</div></div>
+<div class="card"><div class="ctitle">Entitlement + API keys</div><div class="cbody sm"><div class="qbar"><span style="flex:1" class="muted">Tier</span>${badge("b-info","ENTERPRISE (trial)")}</div><div class="qbar"><span style="flex:1" class="muted">API key</span><span class="mono">cpk_live_9f2e… (read-only)</span></div><div class="xs muted">Modules 7/11/12/13/14/15 enabled · meters: questionnaire_answers, vendors.</div></div></div></div>`;}
+function review(){view.innerHTML=`<div class="phead"><h1>Review Console — expert gate</h1><button class="btn btn-o" onclick="this.textContent='scanned'">Scan queues</button></div>
+<div class="card"><table class="tbl"><thead><tr><th>Queue</th><th>Item</th><th>Priority</th><th>Credential</th><th>Status</th></tr></thead><tbody>
+${REVIEWQ.map(r=>`<tr><td>${badge("b-zinc",r.q)}</td><td style="font-weight:550">${r.t}</td><td>${badge(PTONE[r.p],r.p)}</td><td class="xs muted">${r.cred}</td><td>${badge(r.st==="CLAIMED"?"b-info":"b-warn",r.st)}</td></tr>`).join("")}</tbody></table></div>
+<div class="xs muted" style="margin-top:10px">Four-eyes on CRITICAL · credential-gated (CIPA / LEGAL_US_STATES / LEGAL_EU) · approving applies downstream (fan-out tasks, matrix update, framework publish at 100% verified).</div>`;}
+function auditor(){view.innerHTML=`<div class="phead"><h1>Auditor Portal</h1><span class="xs muted">watermarked · scope-limited</span></div>
+<div class="grid g2"><div class="card"><div class="ctitle">Watermarked evidence</div><div class="cbody"><div class="wm card cbody" data-wm="J. Doe · KPMG · wm_a1b2c3 · ${new Date().toISOString().slice(0,10)}"><b>MFA enrollment (Okta)</b><div class="xs muted" style="margin:5px 0">chain VALID · 5 links · quality 96/100 (A)</div><div class="mono">content 3fa2… · chain 9c1e…</div></div><div class="xs muted" style="margin-top:8px">Every view logged with watermark token. Independent verification: recompute sha256(prev‖content).</div></div></div>
+<div class="card"><div class="ctitle">DSAR metrics (k-anonymized, k=5)</div><div class="cbody sm">${[["2025-01","ACCESS",12,"92%"],["2025-02","ACCESS",9,"89%"],["2025-03","ERASE",3,null]].map(r=>`<div class="qbar"><span style="width:60px" class="muted">${r[0]}</span><span style="width:60px">${r[1]}</span><span class="tabular" style="width:40px">n=${r[2]}</span><span style="flex:1">${r[3]??'<span class="muted">suppressed (n&lt;5)</span>'}</span></div>`).join("")}</div></div></div>`;}
+function ethics(){view.innerHTML=`<div class="phead"><h1>Anonymous Ethics Hotline</h1><span class="xs muted">isolated · no logs · diceware</span></div>
+<div class="card cbody" style="max-width:520px;margin:0 auto"><b style="display:block;margin-bottom:8px">🔑 Access passphrase — shown ONCE</b><div class="mono" style="background:var(--muted);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;letter-spacing:.04em">harbor-quantum-lens-drift-echo-nimbus-fern-slate</div><div style="border:1px solid #dc26264d;background:#dc26260d;border-radius:8px;padding:10px;font-size:12px;margin-top:12px;color:var(--fail)"><b>Write it down.</b> Cannot be recovered; we can't identify you.</div><div class="xs muted" style="margin-top:10px">EU 2019/1937: ack ≤7d · feedback ≤3mo · crypto-shred on retention expiry (integrity-gated).</div></div>`;}
+function calculator(){const inp={h:120,sys:8,cloud:2,tsc:.1,type:"TYPE_II",tier:"MID_TIER",ind:.15,prior:false,rate:165};
+let cx=1+Math.min(inp.sys,30)*.015+(inp.cloud-1)*.08+inp.tsc+inp.ind;cx=Math.min(cx,1.8);
+const base={TYPE_I:{B:[8e3,12500,18e3],M:[12e3,18e3,26e3],G:[20e3,30e3,45e3]},TYPE_II:{B:[18e3,26e3,38e3],M:[28e3,40e3,60e3],G:[45e3,75e3,120e3]}}[inp.type][{BOUTIQUE:"B",MID_TIER:"M",BIG_4:"G"}[inp.tier]];
+const rnd=n=>Math.round(n/100)*100;const aud=base.map(x=>rnd(x*cx));
+const hours=Math.round((inp.type==="TYPE_II"?320:200)*cx*(inp.prior?.55:1));const internal=hours*inp.rate;
+const rem=inp.prior?[2e3,6e3,15e30]:[5e3,12e3,30e3];const plat=(inp.h<=50?4990:inp.h<=200?11990:29990)*12;
+const tot=aud.map((a,i)=>a+internal+rem[i]+plat);const m=n=>"$"+n.toLocaleString();
+view.innerHTML=`<div class="phead"><h1>SOC 2 cost calculator</h1></div>
+<div class="grid g3" style="margin-bottom:12px">${["P10 lean","P50 typical","P90 complex"].map((l,i)=>`<div class="card cbody"><div class="xs muted" style="font-weight:650;text-transform:uppercase">${l}</div><div class="tabular" style="font-size:20px;font-weight:650">${m(tot[i])}</div><div class="xs muted">year 2+: ${m(rnd(tot[i]*.6))}</div></div>`).join("")}</div>
+<div class="card"><div class="ctitle">Breakdown (P50)</div><div class="cbody sm">${[["Auditor fee",aud[1]],["Internal labor ("+hours+"h)",internal],["Remediation",rem[1]],["Platform (fixed, annual)",plat]].map(r=>`<div class="qbar"><span style="flex:1" class="muted">${r[0]}</span><b class="tabular">${m(r[1])}</b></div>`).join("")}</div></div>
+<div class="xs muted" style="margin-top:10px">Fixed platform fee by headcount band is the differentiator; auditor bands calibrated quarterly.</div>`;}
+function report(){view.innerHTML=`<div class="phead"><h1>Executive report — 2025-06</h1><button class="btn btn-o">Export PDF</button></div>
+<div class="grid g4" style="margin-bottom:12px">${[["Risk index","31","▼ 6"],["Evidence quality","82%","avg B"],["Gaps closed","14","3 opened"],["DSAR on-time","91%","SLA met"]].map(s=>`<div class="card cbody"><div class="xs muted" style="font-weight:650;text-transform:uppercase">${s[0]}</div><div class="tabular" style="font-size:20px;font-weight:650">${s[1]}</div><div class="xs" style="color:var(--pass)">${s[2]}</div></div>`).join("")}</div>
+<div class="card"><div class="ctitle">Narrative (AI, metric-referenced)</div><div class="cbody sm" style="line-height:1.7">Risk index fell 37→31; top drivers: vendor evidence staleness (34 pts), offboarding FAILING (28). Evidence quality 82% (B), 118 rows graded, no chain-integrity failures. DSAR on-time 91% across 33 requests. One CO amendment pending expert review; no deadlines shifted. Focus: refresh vendor certs, close offboarding remediation before audit window.</div></div>`;}
+go();
+</script>
+</body>
+</html>

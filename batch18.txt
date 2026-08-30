@@ -1,0 +1,847 @@
+### FILE: apps/api/src/handlers/ria.ts
+```typescript
+import { FastifyInstance } from "fastify";
+import { prisma } from "@db/client";
+import { emit } from "@brain/emit";
+/** Read-model for the Regulatory Intelligence Agent surfaces.
+* All queries are defensive: if the batch-17 RIA tables aren't present yet
+* the endpoints degrade to empty shapes instead of 500s. */
+async function safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
+try { return await fn(); } catch { return fallback; }
+}
+export async function riaHandlers(app: FastifyInstance) {
+// ── jurisdictions: crawl status + source rollups ──
+app.get("/v1/ria/jurisdictions", async () => {
+const jurisdictions = await safe(
+() => prisma.jurisdiction.findMany({ orderBy: { code: "asc" } }), [] as any[]);
+const sources = await safe(() => prisma.regSourceCountry.findMany(), [] as any[]);
+const crawls = await safe(
+() => prisma.crawlTask.findMany({ orderBy: { startedAt: "desc" } }), [] as any[]);
+return jurisdictions.map((j: any) => {
+const js = sources.filter((s: any) => s.jurisdictionId === j.id);
+const jc = crawls.filter((c: any) => c.jurisdictionId === j.id);
+const last = jc[0];
+return {
+id: j.id, code: j.code, name: j.name, region: j.region,
+legalTradition: j.legalTradition,
+sourceCount: js.length,
+avgReliability: js.length
+? js.reduce((a: number, s: any) => a + (s.reliability ?? 0.5), 0) / js.length
+: null,
+lastCrawlAt: last?.startedAt ?? null,
+lastCrawlStatus: last?.status ?? null,
+docsExtracted: jc.reduce((a: number, c: any) => a + (c.docsExtracted ?? 0), 0),
+enabled: j.enabled,
+};
+});
+});
+// ── source reliability detail ──
+app.get("/v1/ria/sources", async () => {
+const sources = await safe(
+() => prisma.regSourceCountry.findMany({ orderBy: { reliability: "desc" } }), [] as any[]);
+const jurisdictions = await safe(() => prisma.jurisdiction.findMany(), [] as any[]);
+const byId = new Map(jurisdictions.map((j: any) => [j.id, j.code]));
+return sources.map((s: any) => ({
+id: s.id, name: s.name, url: s.url, parserType: s.parserType,
+jurisdictionCode: byId.get(s.jurisdictionId) ?? null,
+reliability: s.reliability ?? 0.5,
+status: s.status,
+lastCheckedAt: s.lastCheckedAt,
+docsExtracted: s.docsExtracted ?? 0,
+crawlCount: s.crawlCount ?? 0,
+discoveredBy: s.discoveredBy,
+}));
+});
+// ── knowledge graph: reg → requirement → control ──
+app.get("/v1/ria/graph", async (req) => {
+const { jurisdiction } = req.query as { jurisdiction?: string };
+const nodes = await safe(() => prisma.regKnowledgeNode.findMany({
+where: jurisdiction ? { jurisdictionId: jurisdiction } : {},
+orderBy: { confidence: "desc" }, take: 500,
+}), [] as any[]);
+const jurisdictions = await safe(() => prisma.jurisdiction.findMany(), [] as any[]);
+const byId = new Map(jurisdictions.map((j: any) => [j.id, j.code]));
+const counts = { REGULATION: 0, REQUIREMENT: 0, CONTROL: 0, GUIDANCE: 0 };
+for (const n of nodes)
+if ((counts as any)[n.nodeType] !== undefined) (counts as any)[n.nodeType]++;
+return {
+counts,
+nodes: nodes.map((n: any) => ({
+id: n.id, nodeType: n.nodeType, refCode: n.refCode, title: n.title,
+jurisdictionCode: byId.get(n.jurisdictionId) ?? null,
+confidence: n.confidence, verified: n.verified,
+linkedRequirementId: n.linkedRequirementId,
+linkedControlTemplateId: n.linkedControlTemplateId,
+})),
+};
+});
+// ── extraction drift: RIA-relevant open anomalies from the brain ──
+app.get("/v1/ria/drift", async () => {
+const { brainDb } = await import("@brain");
+const anomalies = await safe(() => brainDb.anomaly.findMany({
+where: { status: "OPEN", OR: [
+{ subsystem: { contains: "ria", mode: "insensitive" } },
+{ subsystem: { contains: "extract", mode: "insensitive" } },
+{ subsystem: { contains: "crawl", mode: "insensitive" } },
+{ subsystem: { contains: "retrieval", mode: "insensitive" } },
+{ metric: { contains: "reject", mode: "insensitive" } },
+{ metric: { contains: "drift", mode: "insensitive" } },
+] },
+orderBy: { at: "desc" }, take: 30,
+}), [] as any[]);
+return anomalies.map((a: any) => ({
+id: a.id, detector: a.detector, subsystem: a.subsystem, metric: a.metric,
+value: a.value, baseline: a.baseline, zScore: a.zScore,
+severity: a.severity, at: a.at, details: a.details,
+}));
+});
+// ── learning capture: wired from the review console on reject/modify ──
+// Emits a brain event (the learning substrate) and persists a signal row
+// when the RIA learning table exists. Feeds monitorRetrievalHealth/calibration.
+app.post("/v1/ria/feedback", async (req) => {
+const { reviewItemId, jurisdictionCode, changeType, decision, reasonCode, note } =
+req.body as {
+reviewItemId?: string; jurisdictionCode?: string; changeType?: string;
+decision: "APPROVED" | "REJECTED" | "MODIFIED";
+reasonCode?: string; note?: string };
+emit({ type: "regchange.applied", source: "review",
+payload: { kind: "ria_review_feedback", reviewItemId, jurisdictionCode,
+changeType, decision, reasonCode, note } });
+const stored = await safe(async () =>
+await (prisma as any).regLearningSignal?.create({
+data: { jurisdictionCode: jurisdictionCode ?? "UNKNOWN",
+changeType: changeType ?? "UNKNOWN", decision,
+reasonCode: reasonCode ?? null, note: note ?? null,
+reviewItemId: reviewItemId ?? null },
+}) ?? null, null);
+return { captured: true, stored: !!stored };
+});
+}
+```
+### END FILE
+### FILE: apps/api/src/index.ts
+```typescript
+// OVERRIDE (batch 18) — batch-9 base + RIA read-model handlers registered
+// inside the eitherAuth plugin (session OR API key).
+import Fastify from "fastify";
+import cookie from "@fastify/cookie";
+import cors from "@fastify/cors";
+import { mountCatalogRoutes } from "./routes/catalogRest";
+import { brainRoutes } from "./routes/brain";
+import { brainStreamRoutes } from "./routes/brainStream";
+import { auditorRoutes, auditorGdprRoutes } from "./routes/auditor";
+import { trustRoutes } from "./routes/trust";
+import { reviewRoutes } from "./routes/review";
+import { ethicsEventsRoutes } from "./routes/ethics-events";
+import { controlHandlers } from "./handlers/controls";
+import { reviewHandlers } from "./handlers/questionnaireReview";
+import { riaHandlers } from "./handlers/ria";
+import { eitherAuth } from "./middleware/eitherAuth";
+import { emit } from "@brain/emit";
+import "@skills"; // warm skill + connector registries
+const app = Fastify({ logger: { level: "warn" }, bodyLimit: 12 * 1024 * 1024 });
+await app.register(cookie);
+await app.register(cors, {
+origin: (origin, cb) =>
+cb(null, !origin || origin.includes(process.env.APP_DOMAIN ?? "localhost:3000")),
+credentials: true,
+});
+app.get("/healthz", async () => ({ ok: true, service: "api", at: new Date().toISOString() }));
+// ── screen handlers: session OR API key (encapsulated guard) ─────
+await app.register(async (instance) => {
+instance.addHook("preHandler", eitherAuth(null));
+await controlHandlers(instance);
+await reviewHandlers(instance);
+await riaHandlers(instance);
+});
+// ── catalog REST (entitlement → scope → rate, per route) ─────────
+await app.register(mountCatalogRoutes);
+// ── brain (session per-route) + SSE + public status ──────────────
+await app.register(brainRoutes);
+await app.register(brainStreamRoutes);
+// ── portals & internal bridges (own auth chains) ─────────────────
+await app.register(auditorRoutes);
+await app.register(auditorGdprRoutes);
+await app.register(trustRoutes);
+await app.register(reviewRoutes);
+await app.register(ethicsEventsRoutes);
+app.addHook("onError", async (req, reply, err) => {
+emit({ type: "api.request.failed", source: req.url.startsWith("/mcp") ? "mcp" : "api",
+orgId: req.org?.id, severityOverride: "WARN",
+payload: { url: req.url, status: reply.statusCode,
+error: String(err.message).slice(0, 200) } });
+});
+const port = Number(process.env.PORT ?? 3000);
+await app.listen({ port, host: "0.0.0.0" });
+console.log(`API on :${port}`);
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+process.on(sig, async () => { await app.close(); process.exit(0); });
+}
+```
+### END FILE
+### FILE: apps/web/src/lib/api.ts
+```typescript
+// OVERRIDE (batch 18) — batch-9 client + RIA read-model + review-console methods.
+import type { ChainProof, ControlDetail, QuestionnaireReviewData, ReadinessResponse } from "./types";
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
+export class ApiError extends Error {
+constructor(public status: number, public body: unknown) { super(`API ${status}`); }
+}
+async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+const res = await fetch(`${API_BASE}${path}`, {
+method,
+headers: body ? { "content-type": "application/json" } : undefined,
+body: body ? JSON.stringify(body) : undefined,
+credentials: "include",
+});
+if (!res.ok) throw new ApiError(res.status, await res.json().catch(() => ({})));
+return (res.status === 204 ? undefined : await res.json()) as T;
+}
+// ── RIA read-model types ──
+export interface RiaJurisdiction {
+id: string; code: string; name: string; region: string; legalTradition: string;
+sourceCount: number; avgReliability: number | null;
+lastCrawlAt: string | null; lastCrawlStatus: string | null;
+docsExtracted: number; enabled: boolean;
+}
+export interface RiaSource {
+id: string; name: string; url: string; parserType: string;
+jurisdictionCode: string | null; reliability: number; status: string;
+lastCheckedAt: string | null; docsExtracted: number; crawlCount: number;
+discoveredBy: string;
+}
+export interface RiaGraphNode {
+id: string; nodeType: "REGULATION" | "REQUIREMENT" | "CONTROL" | "GUIDANCE";
+refCode: string; title: string; jurisdictionCode: string | null;
+confidence: number; verified: boolean;
+linkedRequirementId: string | null; linkedControlTemplateId: string | null;
+}
+export interface RiaGraph { counts: Record<string, number>; nodes: RiaGraphNode[] }
+export interface RiaDriftAnomaly {
+id: string; detector: string; subsystem: string; metric: string;
+value: number; baseline: number; zScore: number | null;
+severity: string; at: string; details: unknown;
+}
+// ── review-console types ──
+export interface ReviewQueueItem {
+id: string; queueType: string; sourceId: string; title: string;
+jurisdiction: string | null; frameworks: string[]; priority: string;
+confidence: number; requiredCredential: string | null; status: string;
+claimedByMembershipId: string | null; slaDueAt: string; preview: unknown;
+}
+export interface ReviewBundleBlock {
+kind: "diff-table" | "paraphrase-card" | "impact-list" | "evidence-quote" | "affected-orgs";
+[key: string]: unknown;
+}
+export interface ReviewBundle {
+header: { title: string; jurisdiction?: string; source: string; link?: string };
+body: ReviewBundleBlock[];
+risk: string[];
+}
+export interface ReviewDetail { item: ReviewQueueItem; bundle: ReviewBundle }
+export const api = {
+get: <T>(p: string) => req<T>("GET", p),
+post: <T>(p: string, b?: unknown) => req<T>("POST", p, b),
+readiness: (fw: string) => req<ReadinessResponse>("GET", `/v1/readiness/${fw}`),
+control: (slug: string) => req<ControlDetail>("GET", `/v1/controls/${slug}`),
+chainProof: (slug: string) => req<ChainProof>("GET", `/v1/controls/${slug}/chain-proof`),
+runCheck: (checkId: string) =>
+req<{ runId: string; status: string; evidenceId: string | null }>(
+"POST", `/v1/checks/${checkId}/run`),
+tasks: () => req<{ open: number; overdue: number; byPriority: Record<string, number> }>(
+"GET", "/v1/tasks?summary=1"),
+qualityDist: () => req<Record<string, number>>("GET", "/v1/quality/distribution"),
+regChanges: () => req<{ id: string; summary: string; effectiveAt: string | null }[]>(
+"GET", "/v1/regulatory-changes?limit=3"),
+reviewData: (id: string) => req<QuestionnaireReviewData>(
+"GET", `/v1/questionnaires/${id}/drafts`),
+approve: (id: string, qId: string, answer?: string) =>
+req<{ status: string }>("POST",
+`/v1/questionnaires/${id}/questions/${qId}/approve`, answer ? { answer } : {}),
+reject: (id: string, qId: string, code: string, note?: string) =>
+req<{ status: string }>("POST",
+`/v1/questionnaires/${id}/questions/${qId}/reject`, { code, note }),
+bulkApprove: (id: string, ids: string[]) =>
+req<{ approved: number }>("POST", `/v1/questionnaires/${id}/bulk-approve`, { ids }),
+// ── RIA read-model ──
+riaJurisdictions: () => req<RiaJurisdiction[]>("GET", "/v1/ria/jurisdictions"),
+riaSources: () => req<RiaSource[]>("GET", "/v1/ria/sources"),
+riaGraph: (jurisdiction?: string) =>
+req<RiaGraph>("GET", `/v1/ria/graph${jurisdiction ? `?jurisdiction=${jurisdiction}` : ""}`),
+riaDrift: () => req<RiaDriftAnomaly[]>("GET", "/v1/ria/drift"),
+riaFeedback: (body: {
+reviewItemId?: string; jurisdictionCode?: string; changeType?: string;
+decision: "APPROVED" | "REJECTED" | "MODIFIED"; reasonCode?: string; note?: string;
+}) => req<{ captured: boolean; stored: boolean }>("POST", "/v1/ria/feedback", body),
+// ── review console ──
+reviewQueue: () => req<ReviewQueueItem[]>("GET", "/v1/review/queue"),
+reviewScan: () => req<{ enqueued: number }>("POST", "/v1/review/scan"),
+reviewItem: (id: string) => req<ReviewDetail>("GET", `/v1/review/${id}`),
+reviewClaim: (id: string) => req<unknown>("POST", `/v1/review/${id}/claim`),
+reviewDecide: (id: string, decision: "APPROVE" | "REJECT" | "DEFER",
+note: string, deferUntil?: string) =>
+req<unknown>("POST", `/v1/review/${id}/decide`, { decision, note, deferUntil }),
+reviewRelease: (id: string) => req<unknown>("POST", `/v1/review/${id}/release`),
+reviewStats: () => req<{ byStatus: { status: string; _count: number }[];
+slaBreaches: number }>("GET", "/v1/review/stats"),
+};
+```
+### END FILE
+### FILE: apps/web/src/app/ria/page.tsx
+```tsx
+import { RiaDashboard } from "../../components/RiaDashboard";
+export default function Page() { return <RiaDashboard />; }
+```
+### END FILE
+### FILE: apps/web/src/components/RiaDashboard.tsx
+```tsx
+"use client";
+import { useState } from "react";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { relTime } from "../lib/format";
+import { Badge, Card, CardTitle, Skeleton, Tabs } from "./ui";
+type Tab = "jurisdictions" | "sources" | "drift" | "graph";
+const CRAWL_TONE: Record<string, "pass" | "fail" | "warn" | "zinc"> = {
+DONE: "pass", FAILED: "fail", RUNNING: "info" as never, BLOCKED: "warn" };
+export function RiaDashboard() {
+const jurisdictions = useApi("/v1/ria/jurisdictions", api.riaJurisdictions);
+const sources = useApi("/v1/ria/sources", api.riaSources);
+const drift = useApi("/v1/ria/drift", api.riaDrift);
+const graph = useApi("/v1/ria/graph", () => api.riaGraph());
+const [tab, setTab] = useState<Tab>("jurisdictions");
+const [graphFilter, setGraphFilter] = useState<string | null>(null);
+const j = jurisdictions.data ?? [];
+const s = sources.data ?? [];
+const d = drift.data ?? [];
+const g = graph.data;
+const avgReliability = s.length
+? s.reduce((a, x) => a + x.reliability, 0) / s.length : null;
+const stats = [
+{ label: "Jurisdictions", value: j.length, sub: `${j.filter((x) => x.enabled).length} enabled` },
+{ label: "Active sources", value: s.length,
+sub: avgReliability !== null ? `${Math.round(avgReliability * 100)}% avg reliability` : "—" },
+{ label: "Open drift anomalies", value: d.length,
+sub: d.length ? "extraction quality slipping" : "extraction healthy", warn: d.length > 0 },
+{ label: "Graph nodes", value: g?.nodes.length ?? 0,
+sub: g ? `${g.counts.REGULATION} reg · ${g.counts.REQUIREMENT} req · ${g.counts.CONTROL} ctrl` : "—" },
+];
+return (
+<div className="space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Regulatory Intelligence Agent</h1>
+<span className="text-xs text-muted-foreground">crawl → extract → graph → expert review</span>
+</div>
+<div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+{stats.map((st) => (
+<Card key={st.label} className="p-4">
+<p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{st.label}</p>
+<p className={`mt-1 text-2xl font-semibold tabular-nums ${st.warn ? "text-warn" : ""}`}>{st.value}</p>
+<p className="mt-0.5 text-xs text-muted-foreground">{st.sub}</p>
+</Card>
+))}
+</div>
+<Card>
+<Tabs<Tab> active={tab} onChange={setTab} tabs={[
+{ id: "jurisdictions", label: "Jurisdictions", count: j.length },
+{ id: "sources", label: "Source reliability", count: s.length },
+{ id: "drift", label: "Extraction drift", count: d.length },
+{ id: "graph", label: "Knowledge graph", count: g?.nodes.length ?? 0 },
+]} />
+{tab === "jurisdictions" && (
+<div className="overflow-x-auto">
+{jurisdictions.loading ? <div className="p-4"><Skeleton /></div> : (
+<table className="w-full text-[13px]">
+<thead><tr className="border-b border-border text-left text-[11px] uppercase tracking-wide text-muted-foreground">
+<th className="px-4 py-2">Jurisdiction</th><th className="px-2 py-2">Region</th>
+<th className="px-2 py-2">Sources</th><th className="px-2 py-2">Reliability</th>
+<th className="px-2 py-2">Docs</th><th className="px-2 py-2">Last crawl</th></tr></thead>
+<tbody className="divide-y divide-border">
+{j.map((x) => (
+<tr key={x.id} className={x.enabled ? "" : "opacity-50"}>
+<td className="px-4 py-2"><span className="font-medium">{x.code}</span>
+<span className="ml-2 text-xs text-muted-foreground">{x.name}</span></td>
+<td className="px-2 py-2"><Badge tone="zinc">{x.region}</Badge></td>
+<td className="px-2 py-2 tabular-nums">{x.sourceCount}</td>
+<td className="px-2 py-2">{x.avgReliability !== null
+? <ReliabilityBar v={x.avgReliability} /> : <span className="text-xs text-muted-foreground">—</span>}</td>
+<td className="px-2 py-2 tabular-nums">{x.docsExtracted}</td>
+<td className="px-2 py-2">{x.lastCrawlAt
+? <span className="flex items-center gap-1.5">
+<Badge tone={CRAWL_TONE[x.lastCrawlStatus ?? ""] ?? "zinc"}>{x.lastCrawlStatus ?? "—"}</Badge>
+<span className="text-xs text-muted-foreground">{relTime(x.lastCrawlAt)}</span></span>
+: <span className="text-xs text-muted-foreground">never</span>}</td>
+</tr>
+))}
+{j.length === 0 && <tr><td colSpan={6} className="px-4 py-8 text-center text-xs text-muted-foreground">
+No jurisdictions yet. Load the RIA source pack (<code>db:seed:sources</code>).</td></tr>}
+</tbody></table>
+)}
+</div>
+)}
+{tab === "sources" && (
+<div className="divide-y divide-border">
+{sources.loading ? <div className="p-4"><Skeleton /></div> : s.map((x) => (
+<div key={x.id} className="flex items-center gap-3 px-4 py-3">
+<div className="min-w-0 flex-1">
+<p className="truncate text-[13px] font-medium">{x.name}</p>
+<p className="truncate text-xs text-muted-foreground">
+{x.jurisdictionCode ?? "—"} · {x.parserType} · {x.crawlCount} crawls · {x.docsExtracted} docs
+{x.discoveredBy === "CRAWLER" && <span className="ml-1.5 text-info">auto-discovered</span>}</p>
+</div>
+<ReliabilityBar v={x.reliability} wide />
+<Badge tone={x.status === "ACTIVE" ? "pass" : x.status === "ERROR" ? "fail" : "zinc"}>{x.status}</Badge>
+</div>
+))}
+{s.length === 0 && !sources.loading && <p className="p-8 text-center text-xs text-muted-foreground">No sources registered.</p>}
+</div>
+)}
+{tab === "drift" && (
+<div className="divide-y divide-border">
+{drift.loading ? <div className="p-4"><Skeleton /></div> : d.map((x) => (
+<div key={x.id} className="px-4 py-3">
+<div className="flex items-center gap-2">
+<Badge tone={x.severity === "CRITICAL" ? "fail" : "warn"}>{x.severity}</Badge>
+<span className="text-[13px] font-medium">{x.subsystem}</span>
+<span className="text-xs text-muted-foreground">{x.detector} · {x.metric}</span>
+<span className="ml-auto text-xs text-muted-foreground">{relTime(x.at)}</span>
+</div>
+<p className="mt-1 text-xs text-muted-foreground">
+value <span className="tabular-nums">{x.value}</span> vs baseline <span className="tabular-nums">{x.baseline}</span>
+{x.zScore !== null && <> · z <span className="tabular-nums">{x.zScore}</span></>}
+</p>
+</div>
+))}
+{d.length === 0 && !drift.loading && (
+<p className="p-8 text-center text-xs text-muted-foreground">No open extraction-drift anomalies. The learning loop is holding.</p>
+)}
+</div>
+)}
+{tab === "graph" && (
+<div className="p-4">
+{graph.loading ? <Skeleton /> : g && (
+<>
+<div className="mb-3 flex flex-wrap items-center gap-2">
+<span className="text-xs text-muted-foreground">Filter:</span>
+<button onClick={() => setGraphFilter(null)}
+className={`rounded border px-2 py-0.5 text-xs ${graphFilter === null ? "border-zinc-900 bg-zinc-900 text-white" : "border-border"}`}>All</button>
+{["REGULATION", "REQUIREMENT", "CONTROL", "GUIDANCE"].map((t) => (
+<button key={t} onClick={() => setGraphFilter(t)}
+className={`rounded border px-2 py-0.5 text-xs ${graphFilter === t ? "border-zinc-900 bg-zinc-900 text-white" : "border-border"}`}>
+{t} ({g.counts[t] ?? 0})</button>
+))}
+</div>
+<div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+{g.nodes.filter((n) => !graphFilter || n.nodeType === graphFilter).slice(0, 60).map((n) => (
+<div key={n.id} className="rounded-md border border-border bg-white p-2.5">
+<div className="flex items-center gap-1.5">
+<Badge tone={n.nodeType === "REGULATION" ? "info" : n.nodeType === "REQUIREMENT" ? "zinc" : n.nodeType === "CONTROL" ? "pass" : "draft"}>{n.nodeType}</Badge>
+<span className="font-mono text-[11px] text-muted-foreground">{n.refCode}</span>
+{n.verified && <span className="text-pass" title="expert-verified">✓</span>}
+</div>
+<p className="mt-1 line-clamp-2 text-xs">{n.title}</p>
+<p className="mt-0.5 text-[11px] text-muted-foreground">
+{n.jurisdictionCode ?? "—"} · conf <span className="tabular-nums">{n.confidence.toFixed(2)}</span></p>
+</div>
+))}
+</div>
+{g.nodes.length === 0 && <p className="py-8 text-center text-xs text-muted-foreground">Knowledge graph is empty — run a crawl to populate it.</p>}
+</>
+)}
+</div>
+)}
+</Card>
+</div>
+);
+}
+function ReliabilityBar({ v, wide }: { v: number; wide?: boolean }) {
+const pct = Math.round(v * 100);
+const color = v >= 0.85 ? "bg-pass" : v >= 0.6 ? "bg-warn" : "bg-fail";
+return (
+<div className="flex items-center gap-2">
+<div className={`h-1.5 rounded bg-muted ${wide ? "w-32" : "w-20"}`}>
+<div className={`h-1.5 rounded ${color}`} style={{ width: `${pct}%` }} />
+</div>
+<span className="text-xs text-muted-foreground tabular-nums">{pct}%</span>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/review/page.tsx
+```tsx
+import { ReviewConsole } from "../../components/ReviewConsole";
+export default function Page() { return <ReviewConsole />; }
+```
+### END FILE
+### FILE: apps/web/src/components/ReviewConsole.tsx
+```tsx
+"use client";
+import { useMemo, useState } from "react";
+import { api, ApiError } from "../lib/api";
+import type { ReviewBundleBlock, ReviewDetail, ReviewQueueItem } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { relTime } from "../lib/format";
+import { Badge, Button, Card, Kbd, Modal, Skeleton } from "./ui";
+const QUEUE_LABEL: Record<string, string> = {
+FRAMEWORK_CONTENT: "Framework content", MATRIX_PROPOSAL: "Matrix proposal", REG_CHANGE: "Reg change" };
+const PRIO_TONE: Record<string, "pass" | "fail" | "warn" | "info" | "zinc"> = {
+CRITICAL: "fail", HIGH: "warn", MEDIUM: "info", LOW: "zinc" };
+const STATUS_TONE: Record<string, "pass" | "fail" | "warn" | "info" | "zinc"> = {
+PENDING: "warn", CLAIMED: "info", APPROVED_PENDING_SECOND: "info",
+APPROVED: "pass", REJECTED: "fail", DEFERRED: "zinc", SUPERSEDED: "zinc" };
+// Learning-capture taxonomy for rejections (feeds the RIA learning loop)
+const REJECT_CODES = [
+{ code: "NOT_A_CHANGE", label: "Not a regulatory change" },
+{ code: "WRONG_JURISDICTION", label: "Wrong jurisdiction" },
+{ code: "MISREAD_DEADLINE", label: "Misread the deadline" },
+{ code: "OVER_EXTRACTED", label: "Over-extracted (invented obligations)" },
+{ code: "UNDER_EXTRACTED", label: "Under-extracted (missed obligations)" },
+{ code: "DUPLICATE", label: "Duplicate of an existing change" },
+{ code: "OTHER", label: "Other" },
+] as const;
+export function ReviewConsole() {
+const queue = useApi("/v1/review/queue", api.reviewQueue);
+const stats = useApi("/v1/review/stats", api.reviewStats);
+const [selectedId, setSelectedId] = useState<string | null>(null);
+const [detail, setDetail] = useState<ReviewDetail | null>(null);
+const [detailErr, setDetailErr] = useState<string | null>(null);
+const [filter, setFilter] = useState<string | null>(null);
+const [busy, setBusy] = useState(false);
+const [flash, setFlash] = useState<string | null>(null);
+const [note, setNote] = useState("");
+const [rejectOpen, setRejectOpen] = useState(false);
+const [reasonCode, setReasonCode] = useState<string>("OTHER");
+const say = (m: string) => { setFlash(m); setTimeout(() => setFlash(null), 3500); };
+const items = useMemo(() => {
+const list = queue.data ?? [];
+return filter ? list.filter((i) => i.queueType === filter) : list;
+}, [queue.data, filter]);
+const openDetail = async (id: string) => {
+setSelectedId(id); setDetail(null); setDetailErr(null); setNote("");
+try { setDetail(await api.reviewItem(id)); }
+catch (e) {
+setDetailErr(e instanceof ApiError && e.status === 403
+? "Requires a platform reviewer credential." : (e as Error).message);
+}
+};
+const doScan = async () => {
+setBusy(true);
+try { const r = await api.reviewScan(); say(`Scan complete — ${r.enqueued} item(s) enqueued`); queue.refresh(); }
+catch (e) { say(`Scan failed: ${(e as Error).message}`); }
+finally { setBusy(false); }
+};
+const doClaim = async () => {
+if (!selectedId) return; setBusy(true);
+try { await api.reviewClaim(selectedId); say("Claimed"); await openDetail(selectedId); queue.refresh(); }
+catch (e) { say(`Claim failed: ${(e as Error).message}`); }
+finally { setBusy(false); }
+};
+const doApprove = async () => {
+if (!selectedId) return; setBusy(true);
+try {
+await api.reviewDecide(selectedId, "APPROVE", note);
+// learning capture: positive signal
+await api.riaFeedback({ reviewItemId: selectedId,
+jurisdictionCode: detail?.item.jurisdiction ?? undefined,
+decision: "APPROVED", note });
+say("Approved — applied downstream (fan-out / matrix update)");
+setSelectedId(null); setDetail(null); queue.refresh();
+} catch (e) { say(`Approve failed: ${(e as Error).message}`); }
+finally { setBusy(false); }
+};
+const doReject = async () => {
+if (!selectedId) return; setBusy(true);
+try {
+await api.reviewDecide(selectedId, "REJECT", `[${reasonCode}] ${note}`);
+// learning capture: rejection reason feeds extraction calibration
+await api.riaFeedback({ reviewItemId: selectedId,
+jurisdictionCode: detail?.item.jurisdiction ?? undefined,
+changeType: detail?.item.queueType, decision: "REJECTED",
+reasonCode, note });
+say(`Rejected (${reasonCode}) — captured for the learning loop`);
+setRejectOpen(false); setSelectedId(null); setDetail(null); queue.refresh();
+} catch (e) { say(`Reject failed: ${(e as Error).message}`); }
+finally { setBusy(false); }
+};
+const doRelease = async () => {
+if (!selectedId) return; setBusy(true);
+try { await api.reviewRelease(selectedId); say("Released"); setSelectedId(null); setDetail(null); queue.refresh(); }
+catch (e) { say(`Release failed: ${(e as Error).message}`); }
+finally { setBusy(false); }
+};
+const slaBreaches = stats.data?.slaBreaches ?? 0;
+return (
+<div className="flex h-[calc(100vh-3rem)] flex-col">
+<div className="flex flex-wrap items-center gap-3 border-b border-border pb-3">
+<h1 className="text-[15px] font-semibold">Review Console — Expert Gate</h1>
+<Badge tone="zinc">{(queue.data ?? []).length} queued</Badge>
+{slaBreaches > 0 && <Badge tone="fail">{slaBreaches} SLA breaches</Badge>}
+<div className="flex-1" />
+<Button variant="outline" onClick={doScan} disabled={busy}>{busy ? "Scanning…" : "Scan queues"}</Button>
+</div>
+{flash && <div className="border-b border-info/30 bg-info/5 px-4 py-1.5 text-xs text-info">{flash}</div>}
+<div className="mt-2 flex flex-wrap gap-2">
+<button onClick={() => setFilter(null)}
+className={`rounded border px-2 py-1 text-xs ${filter === null ? "border-zinc-900 bg-zinc-900 text-white" : "border-border"}`}>All</button>
+{Object.keys(QUEUE_LABEL).map((q) => (
+<button key={q} onClick={() => setFilter(q)}
+className={`rounded border px-2 py-1 text-xs ${filter === q ? "border-zinc-900 bg-zinc-900 text-white" : "border-border"}`}>
+{QUEUE_LABEL[q]}</button>
+))}
+</div>
+<div className="mt-3 grid flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[360px_1fr]">
+{/* LEFT — queue */}
+<div className="overflow-y-auto border-r border-border">
+{queue.loading ? <div className="p-4"><Skeleton /></div> : items.map((it) => (
+<button key={it.id} onClick={() => openDetail(it.id)}
+className={`flex w-full flex-col gap-1 border-b border-border px-3 py-2.5 text-left ${selectedId === it.id ? "bg-muted" : "hover:bg-muted/50"}`}>
+<div className="flex items-center gap-2">
+<Badge tone={PRIO_TONE[it.priority] ?? "zinc"}>{it.priority}</Badge>
+<span className="min-w-0 flex-1 truncate text-[13px] font-medium">{it.title}</span>
+</div>
+<div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+<span>{QUEUE_LABEL[it.queueType] ?? it.queueType}</span>
+{it.jurisdiction && <span className="font-mono">{it.jurisdiction}</span>}
+<span>· conf {it.confidence.toFixed(2)}</span>
+<span className="ml-auto">due {relTime(it.slaDueAt)}</span>
+</div>
+<div className="flex items-center gap-2">
+<Badge tone={STATUS_TONE[it.status] ?? "zinc"}>{it.status}</Badge>
+{it.requiredCredential && <Badge tone="draft">{it.requiredCredential}</Badge>}
+</div>
+</button>
+))}
+{items.length === 0 && !queue.loading && (
+<p className="p-8 text-center text-xs text-muted-foreground">Queue is clear. Run a scan to enqueue new items.</p>
+)}
+</div>
+{/* RIGHT — detail */}
+<div className="overflow-y-auto p-5">
+{!selectedId && <EmptyDetail />}
+{selectedId && detailErr && (
+<Card className="p-6 text-center text-sm text-muted-foreground">{detailErr}</Card>
+)}
+{selectedId && detail && (
+<DetailPane item={detail.item} bundle={detail.bundle}
+note={note} setNote={setNote} busy={busy}
+onClaim={doClaim} onApprove={doApprove}
+onReject={() => setRejectOpen(true)} onRelease={doRelease} />
+)}
+</div>
+</div>
+{/* reject modal with learning taxonomy */}
+<Modal open={rejectOpen} onClose={() => setRejectOpen(false)} title="Reject — reason feeds the learning loop">
+<div className="space-y-2">
+{REJECT_CODES.map((c) => (
+<label key={c.code} className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-[13px]">
+<input type="radio" name="reason" checked={reasonCode === c.code}
+onChange={() => setReasonCode(c.code)} />
+{c.label}
+</label>
+))}
+<textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2}
+placeholder="Reviewer note (optional)…"
+className="w-full rounded-md border border-border p-2 text-[13px]" />
+<div className="flex justify-end gap-2">
+<Button variant="ghost" onClick={() => setRejectOpen(false)}>Cancel</Button>
+<Button variant="danger" onClick={doReject} disabled={busy}>{busy ? "Rejecting…" : "Reject"}</Button>
+</div>
+</div>
+</Modal>
+</div>
+);
+}
+function EmptyDetail() {
+return (
+<div className="flex h-full flex-col items-center justify-center text-center">
+<p className="text-sm font-medium">Select an item to review</p>
+<p className="mt-1 max-w-sm text-xs text-muted-foreground">
+Approving applies the change downstream (fan-out tasks / matrix update / framework publish).
+Rejecting captures a reason code that calibrates the extraction pipeline.</p>
+</div>
+);
+}
+function DetailPane({ item, bundle, note, setNote, busy, onClaim, onApprove, onReject, onRelease }: {
+item: ReviewQueueItem; bundle: ReviewDetail["bundle"]; note: string;
+setNote: (s: string) => void; busy: boolean;
+onClaim: () => void; onApprove: () => void; onReject: () => void; onRelease: () => void;
+}) {
+const claimed = item.status === "CLAIMED" || item.status === "APPROVED_PENDING_SECOND";
+const needsSecond = item.status === "APPROVED_PENDING_SECOND";
+return (
+<div className="space-y-4">
+<div>
+<div className="flex items-center gap-2">
+<Badge tone={PRIO_TONE[item.priority] ?? "zinc"}>{item.priority}</Badge>
+<Badge tone="zinc">{QUEUE_LABEL[item.queueType] ?? item.queueType}</Badge>
+{item.jurisdiction && <Badge tone="info">{item.jurisdiction}</Badge>}
+{item.requiredCredential && <Badge tone="draft">requires {item.requiredCredential}</Badge>}
+</div>
+<h2 className="mt-2 text-[15px] font-semibold leading-relaxed">{bundle.header.title}</h2>
+<p className="mt-1 text-xs text-muted-foreground">
+Source: {bundle.header.source}{bundle.header.link && <> · <a href={bundle.header.link} target="_blank" rel="noreferrer" className="text-info hover:underline">open ↗</a></>}
+</p>
+</div>
+{bundle.risk.length > 0 && (
+<div className="rounded-md border border-warn/30 bg-warn/5 p-3">
+<p className="text-xs font-medium text-warn">Reviewer caution</p>
+<ul className="mt-1 list-disc pl-4 text-xs text-zinc-700">
+{bundle.risk.map((r, i) => <li key={i}>{r}</li>)}
+</ul>
+</div>
+)}
+<div className="space-y-3">
+{bundle.body.map((block, i) => <BundleBlock key={i} block={block} />)}
+</div>
+<textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2}
+placeholder="Decision note (recorded in the audit trail)…"
+className="w-full rounded-md border border-border p-2 text-[13px]" />
+<div className="flex flex-wrap gap-2">
+{!claimed && <Button variant="outline" onClick={onClaim} disabled={busy}>Claim</Button>}
+{claimed && <Button variant="ghost" onClick={onRelease} disabled={busy}>Release</Button>}
+<div className="flex-1" />
+<Button variant="danger" onClick={onReject} disabled={busy}>Reject</Button>
+<Button variant="success" onClick={onApprove} disabled={busy}>
+{needsSecond ? "Second approval (four-eyes)" : "Approve"} <Kbd>A</Kbd>
+</Button>
+</div>
+{item.priority === "CRITICAL" && !needsSecond && (
+<p className="text-[11px] text-muted-foreground">CRITICAL item — approval requires a second reviewer (four-eyes).</p>
+)}
+</div>
+);
+}
+function BundleBlock({ block }: { block: ReviewBundleBlock }) {
+switch (block.kind) {
+case "diff-table": {
+const rows = block.rows as { field: string; from: string; to: string; quote?: string; confidence?: number }[];
+return (
+<Card><CardTitle>Proposed change (diff)</CardTitle>
+<div className="overflow-x-auto"><table className="w-full text-[13px]">
+<thead><tr className="border-b border-border text-left text-[11px] uppercase tracking-wide text-muted-foreground">
+<th className="px-3 py-2">Field</th><th className="px-3 py-2">From</th><th className="px-3 py-2">To</th><th className="px-3 py-2">Conf</th></tr></thead>
+<tbody className="divide-y divide-border">{rows.map((r, i) => (
+<tr key={i}>
+<td className="px-3 py-2 font-mono text-xs">{r.field}</td>
+<td className="px-3 py-2 text-xs text-fail line-through">{r.from}</td>
+<td className="px-3 py-2 text-xs text-pass">{r.to}</td>
+<td className="px-3 py-2 text-xs tabular-nums">{r.confidence?.toFixed(2) ?? "—"}</td>
+</tr>))}</tbody></table></div>
+</Card>
+);
+}
+case "paraphrase-card": {
+const req = block.requirement as { code: string; title: string; desc: string };
+return (
+<Card><CardTitle>Requirement paraphrase <span className="normal-case text-[10px] text-muted-foreground">(verify against licensed source)</span></CardTitle>
+<div className="p-3">
+<p className="font-mono text-xs text-info">{req.code}</p>
+<p className="mt-1 text-[13px] font-medium">{req.title}</p>
+<p className="mt-1 text-xs leading-relaxed text-muted-foreground">{req.desc}</p>
+{block.officialHint && <p className="mt-2 text-[11px] text-warn">{String(block.officialHint)}</p>}
+</div>
+</Card>
+);
+}
+case "impact-list": {
+const items = block.items as { label: string; level: string; action?: string }[];
+return (
+<Card><CardTitle>Impact assessment</CardTitle>
+<div className="divide-y divide-border">{items.map((it, i) => (
+<div key={i} className="flex items-center gap-2 px-3 py-2 text-[13px]">
+<Badge tone={it.level === "CRITICAL" ? "fail" : it.level === "MAJOR" ? "warn" : it.level === "MINOR" ? "info" : "zinc"}>{it.level}</Badge>
+<span className="min-w-0 flex-1">{it.label}</span>
+{it.action && <span className="text-xs text-muted-foreground">{it.action}</span>}
+</div>))}</div>
+</Card>
+);
+}
+case "evidence-quote": {
+const quotes = block.quotes as { source: string; text: string }[];
+return (
+<Card><CardTitle>Extracted evidence</CardTitle>
+<div className="space-y-2 p-3">{quotes.map((q, i) => (
+<div key={i} className="border-l-2 border-border pl-3">
+<p className="text-[11px] font-medium text-muted-foreground">{q.source}</p>
+<p className="mt-0.5 text-xs leading-relaxed text-zinc-700">{q.text}</p>
+</div>))}</div>
+</Card>
+);
+}
+case "affected-orgs": {
+const count = block.count as number; const orgs = block.orgs as string[];
+return (
+<Card><CardTitle>Blast radius</CardTitle>
+<div className="p-3 text-[13px]">
+<p><span className="font-semibold tabular-nums">{count}</span> org(s) affected via accepted mappings.</p>
+{orgs.length > 0 && <p className="mt-1 font-mono text-[11px] text-muted-foreground">{orgs.join(", ")}{count > orgs.length ? " …" : ""}</p>}
+</div>
+</Card>
+);
+}
+default:
+return null;
+}
+}
+```
+### END FILE
+### FILE: apps/web/src/components/AppShell.tsx
+```tsx
+"use client";
+// OVERRIDE (batch 18) — adds /ria and /review to the nav.
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { ReactNode } from "react";
+const NAV = [
+{ href: "/", label: "Home", icon: "▣" },
+{ href: "/controls", label: "Controls", icon: "◇" },
+{ href: "/evidence", label: "Evidence", icon: "≣" },
+{ href: "/tests", label: "Tests", icon: "⚙" },
+{ href: "/tasks", label: "Tasks", icon: "✓", badge: 7 },
+{ href: "/policies", label: "Policies", icon: "▤" },
+{ href: "/questionnaires", label: "Questionnaires", icon: "▦", badge: 32 },
+{ href: "/vendors", label: "Vendors", icon: "⌂" },
+{ href: "/privacy", label: "Privacy", icon: "⛨" },
+{ href: "/incidents", label: "Incidents", icon: "⚠" },
+{ href: "/radar", label: "Reg Radar", icon: "📡" },
+{ href: "/ria", label: "RIA", icon: "🛰" },
+{ href: "/review", label: "Review Console", icon: "🔍", badge: 4 },
+{ href: "/brain", label: "Brain", icon: "⬢" },
+];
+export function AppShell({ children }: { children: ReactNode }) {
+const path = usePathname();
+return (
+<div className="flex min-h-screen">
+<aside className="fixed inset-y-0 left-0 z-30 hidden w-[220px] flex-col border-r border-border bg-white md:flex">
+<div className="flex h-12 items-center gap-2 border-b border-border px-4 font-semibold">
+<span className="text-info">⬢</span> Compliance
+</div>
+<nav className="flex-1 space-y-0.5 overflow-y-auto p-2">
+{NAV.map((n) => {
+const active = n.href === "/" ? path === "/" : path.startsWith(n.href);
+return (
+<Link key={n.href} href={n.href}
+className={`flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px] ${active ? "bg-muted font-medium" : "text-zinc-600 hover:bg-muted/60"}`}>
+<span className="w-4 text-center text-muted-foreground">{n.icon}</span>
+<span className="flex-1">{n.label}</span>
+{n.badge !== undefined && <span className="rounded bg-zinc-900 px-1.5 text-[11px] font-medium text-white tabular-nums">{n.badge}</span>}
+</Link>
+);
+})}
+</nav>
+<div className="border-t border-border p-3 text-[11px] text-muted-foreground">⌘K to search</div>
+</aside>
+<main className="flex-1 md:pl-[220px]">
+<div className="flex h-12 items-center gap-3 border-b border-border px-6">
+<span className="text-xs text-muted-foreground">⌘K Search…</span>
+<div className="flex-1" />
+<span className="text-xs text-muted-foreground">Acme Corp</span>
+</div>
+<div className="p-6">{children}</div>
+</main>
+</div>
+);
+}
+```
+### END FILE

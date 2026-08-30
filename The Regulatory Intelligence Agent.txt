@@ -1,0 +1,38 @@
+                        ┌─────────────────────────────────────┐
+                        │   REGULATORY INTELLIGENCE AGENT      │
+                        │                                       │
+   Jurisdiction         │  ┌─────────┐   ┌──────────────┐    │
+   Registry      ──────▶│  │ CRAWLER │──▶│  EXTRACTOR   │    │
+   (countries,          │  │ (agent- │   │ (multi-format│    │
+    regulators,         │  │  driven)│   │  + confidence│    │
+    feeds)              │  └─────────┘   └──────┬───────┘    │
+                        │                        │             │
+                        │              ┌─────────▼──────────┐ │
+                        │              │  KNOWLEDGE GRAPH    │ │
+                        │              │ reg → req → control │ │
+                        │              │ (cross-jurisdiction)│ │
+                        │              └─────────┬──────────┘ │
+                        └────────────────────────┼────────────┘
+                                                 │
+                          RegChange + impacts    ▼
+                        ┌─────────────────────────────────────┐
+                        │         REVIEW CONSOLE               │
+                        │   (expert approve/reject/modify)     │
+                        └────────────────┬────────────────────┘
+                                         │ feedback signal
+                                         ▼
+                        ┌─────────────────────────────────────┐
+                        │         LEARNING LOOP                │
+                        │  • source reliability scores         │
+                        │  • extraction calibration            │
+                        │  • impact-grading accuracy           │
+                        │  • routing weights                   │
+                        └────────────────┬────────────────────┘
+                                         │
+                                         ▼
+                        ┌─────────────────────────────────────┐
+                        │   BRAIN (evolves with changes)       │
+                        │  consumes learning signals, adjusts  │
+                        │  baselines/thresholds, diagnostician │
+                        │  answers "how accurate are we?"      │
+                        └─────────────────────────────────────┘

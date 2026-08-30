@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Compliance Platform</title>
+<style>
+:root{--bg:#fff;--sf:#fafafa;--mu:#f4f4f5;--mu2:#e4e4e7;--fg:#18181b;--fg2:#52525b;--fg3:#71717a;--bd:#e4e4e7;
+--pass:#16a34a;--fail:#dc2626;--warn:#d97706;--info:#2563eb;--draft:#a16207;--acc:#4f46e5}
+*{box-sizing:border-box;margin:0;padding:0}html{font-size:13px}
+body{font:13px/1.55 Inter,-apple-system,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+a{color:inherit;text-decoration:none;cursor:pointer}button{font:inherit;cursor:pointer;border:none;background:none;color:inherit}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:11px}.tab{font-variant-numeric:tabular-nums}
+.shell{display:flex;min-height:100vh}
+.sb{width:225px;flex-shrink:0;border-right:1px solid var(--bd);position:sticky;top:0;height:100vh;display:flex;flex-direction:column;background:#fff}
+.logo{height:50px;display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--bd);padding:0 16px;font-weight:650;font-size:15px}
+.logo .hx{width:27px;height:27px;border-radius:8px;background:var(--acc);display:grid;place-items:center;color:#fff}
+.nav{flex:1;overflow-y:auto;padding:8px 10px 16px}
+.ng{margin-top:12px}.nl{font-size:10px;font-weight:650;text-transform:uppercase;letter-spacing:.09em;color:var(--fg3);padding:0 9px 5px}
+.nav a{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:7px;color:var(--fg2);margin-bottom:1px;font-size:13px}
+.nav a:hover{background:var(--mu)}.nav a.on{background:var(--mu2);color:var(--fg);font-weight:550}
+.nav .ic{width:16px;text-align:center;color:var(--fg3)}.nav .bd{margin-left:auto;background:var(--acc);color:#fff;border-radius:99px;padding:0 6px;font-size:10px;font-weight:600}
+.main{flex:1;min-width:0}
+.tb{height:50px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:12px;padding:0 20px;position:sticky;top:0;background:#fff;z-index:20}
+.search{flex:1;max-width:300px;display:flex;align-items:center;gap:8px;background:var(--mu);border:1px solid var(--bd);border-radius:8px;padding:6px 11px;color:var(--fg3)}
+.tb .sp{flex:1}.av{width:30px;height:30px;border-radius:50%;background:var(--acc);color:#fff;display:grid;place-items:center;font-size:11px;font-weight:650}
+.ct{padding:20px;max-width:1250px;margin:0 auto}
+h1{font-size:16px;font-weight:650}h2{font-size:14px;font-weight:600}
+.ph{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.ps{color:var(--fg3);font-size:12px;margin-top:2px}
+.card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;overflow:hidden}
+.cti{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--bd);padding:10px 14px;font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.07em;color:var(--fg3)}
+.cb{padding:14px}
+.g{display:grid;gap:12px}.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:repeat(3,1fr)}.g4{grid-template-columns:repeat(4,1fr)}.gm{grid-template-columns:1fr 350px}
+@media(max-width:1000px){.g2,.g3,.g4,.gm{grid-template-columns:1fr}.sb{display:none}}
+.badge{display:inline-flex;align-items:center;gap:4px;border:1px solid;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:550}
+.b-pass{color:var(--pass);background:#16a34a1a;border-color:#16a34a4d}.b-fail{color:var(--fail);background:#dc26261a;border-color:#dc26264d}
+.b-warn{color:var(--warn);background:#d977061a;border-color:#d977064d}.b-info{color:var(--info);background:#2563eb1a;border-color:#2563eb4d}
+.b-draft{color:var(--draft);background:#a162071a;border-color:#a1620766;border-style:dashed}.b-zinc{color:var(--fg3);background:var(--mu);border-color:var(--bd)}
+.btn{display:inline-flex;align-items:center;gap:6px;height:31px;border-radius:7px;padding:0 13px;font-size:12.5px;font-weight:550;border:1px solid transparent}
+.btn:disabled{opacity:.4;pointer-events:none}
+.btn-p{background:#18181b;color:#fff}.btn-o{border-color:var(--bd);background:#fff}.btn-o:hover{background:var(--mu)}
+.btn-s{background:#16a34a1a;color:var(--pass);border-color:#16a34a4d}.btn-d{background:#dc26261a;color:var(--fail);border-color:#dc26264d}
+.muted{color:var(--fg3)}.sm{font-size:12px}.xs{font-size:11px}
+.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tbl th{text-align:left;font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.07em;color:var(--fg3);padding:8px 14px;border-bottom:1px solid var(--bd)}
+.tbl td{padding:9px 14px;border-bottom:1px solid var(--bd);vertical-align:middle}.tbl tr:last-child td{border-bottom:none}.tbl tr:hover td{background:#fafafa}
+.row{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--bd)}.row:last-child{border-bottom:none}.row:hover{background:#fafafa}
+.ring{position:relative;display:inline-grid;place-items:center}.ring svg{transform:rotate(-90deg)}
+.ring .c{position:absolute;text-align:center}.ring .c b{font-size:19px;font-weight:650;display:block}.ring .c span{font-size:10px;color:var(--fg3)}
+.frow{display:flex;gap:9px;align-items:flex-start;padding:7px 14px;border-bottom:1px solid var(--bd);font-size:12px}.frow:last-child{border-bottom:none}.frow .t{color:var(--fg3);width:44px;flex-shrink:0}
+.chain{border:1px solid var(--bd);border-left:4px solid var(--pass);border-radius:8px;background:#fff;margin-bottom:6px}
+.chain.f{border-left-color:var(--fail)}
+.chead{display:flex;align-items:center;gap:9px;padding:8px 12px;width:100%;text-align:left;cursor:pointer}
+.qbar{display:flex;align-items:center;gap:9px;font-size:12px;margin-bottom:8px}.qbar .tr{flex:1;height:8px;background:var(--mu);border-radius:99px;overflow:hidden}.qbar .fl{height:100%;border-radius:99px}
+.subsys{display:flex;align-items:center;gap:10px;font-size:12px;padding:7px 0;border-bottom:1px solid var(--bd)}.subsys:last-child{border-bottom:none}
+.subsys .tr{flex:1;height:6px;background:var(--mu);border-radius:99px;overflow:hidden}.subsys .fl{height:100%;border-radius:99px}
+.steps{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:10px 0}.stp{border-radius:6px;padding:2px 8px;font-size:10.5px;font-weight:600}
+.stp.on{background:#2563eb1a;color:var(--info)}.stp.off{background:var(--mu);color:var(--fg3)}
+.clock{font-family:ui-monospace,monospace;font-weight:650;font-size:14px}.clock.crit{color:var(--fail)}.clock.wr{color:var(--warn)}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.dot.pass{background:var(--pass)}.dot.fail{background:var(--fail)}.dot.warn{background:var(--warn)}.dot.info{background:var(--info)}.dot.zinc{background:var(--fg3)}
+.rev{display:grid;grid-template-columns:270px 1fr 290px;height:calc(100vh - 190px);border:1px solid var(--bd);border-radius:10px;overflow:hidden;background:#fff}
+@media(max-width:1000px){.rev{grid-template-columns:1fr;height:auto}}
+.rev .pn{overflow-y:auto}.rev .lf{border-right:1px solid var(--bd);background:var(--sf)}.rev .cn{padding:20px}.rev .rt{border-left:1px solid var(--bd);padding:15px;background:var(--sf)}
+.qi{display:flex;gap:8px;width:100%;padding:7px 12px;text-align:left;font-size:12px;align-items:center;border-bottom:1px solid var(--bd)}.qi:hover{background:var(--mu)}.qi.on{background:var(--mu2);font-weight:550}
+.gh{position:sticky;top:0;background:var(--sf);padding:7px 12px;font-size:10.5px;font-weight:650;text-transform:uppercase;letter-spacing:.07em;color:var(--fg3)}
+.src{border:1px solid var(--bd);background:#fff;border-radius:9px;padding:11px;margin-bottom:9px}.src .ex{margin-top:7px;border-left:2px solid var(--mu2);padding-left:9px;font-size:12px;color:var(--fg2)}
+.ov{position:fixed;inset:0;background:#0006;display:flex;align-items:flex-start;justify-content:center;padding:16px;padding-top:8vh;z-index:50}
+.mo{background:#fff;border:1px solid var(--bd);border-radius:12px;width:100%;max-width:540px;box-shadow:0 20px 50px #0003;max-height:85vh;overflow-y:auto}
+.mo .mh{border-bottom:1px solid var(--bd);padding:12px 16px;font-weight:600}.mo .mb{padding:16px}
+kbd{border:1px solid var(--bd);background:var(--mu);border-radius:4px;padding:0 5px;font-size:10px;color:var(--fg3)}
+.passp{font-family:ui-monospace,monospace;font-size:15px;background:var(--mu);border:1px solid var(--bd);border-radius:9px;padding:12px;letter-spacing:.04em;text-align:center}
+.flash{border:1px solid #2563eb4d;background:#2563eb0d;border-radius:8px;padding:8px 13px;font-size:12px;color:var(--info);margin-bottom:12px}
+.empty{padding:30px;text-align:center;color:var(--fg3)}
+.err{color:var(--fail);padding:20px;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px}
+</style>
+</head>
+<body>
+<div class="shell">
+<aside class="sb">
+<div class="logo"><span class="hx">⬢</span> Compliance <span class="badge b-zinc" style="margin-left:auto">v2</span></div>
+<nav class="nav" id="nav"></nav>
+</aside>
+<div class="main">
+<div class="tb"><div class="search">🔍 <span>Search…</span><kbd style="margin-left:auto">⌘K</kbd></div><div class="sp"></div><span class="xs muted">Acme Corp</span><div class="av">SC</div></div>
+<div class="ct" id="view"><div class="empty">Loading…</div></div>
+</div>
+</div>
+<div id="modal"></div>
+<script>
+/* Show any error on-page instead of going blank */
+window.addEventListener('error',function(e){
+var v=document.getElementById('view');
+if(v)v.innerHTML='<div class="err">JS ERROR: '+(e&&e.message?e.message:'unknown')+'</div>';
+});
+try{
+/* ---------- helpers ---------- */
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function rhex(){return Math.random().toString(16).slice(2,10);}
+function dstr(d){return new Date(d).toLocaleDateString([],{month:'short',day:'numeric'});}
+function tstr(d){return new Date(d).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+function rel(d){var s=(Date.now()-new Date(d))/1000;return s<3600?Math.floor(s/60)+'m ago':s<86400?Math.floor(s/3600)+'h ago':Math.floor(s/86400)+'d ago';}
+function B(t,x){return '<span class="badge '+t+'">'+x+'</span>';}
+var DAY=864e5;
+/* ---------- mock data ---------- */
+var FW={SOC2:{p:87,t:46,d:40,n:'SOC 2'},ISO27001:{p:74,t:93,d:69,n:'ISO 27001'},HIPAA:{p:81,t:42,d:34,n:'HIPAA'},GDPR:{p:68,t:25,d:17,n:'GDPR'}};
+var CONTROLS=[
+{slug:'access.adminMfa',name:'MFA for Privileged Accounts',state:'PASSING',grade:'A',score:96,st:'IMPLEMENTED',reqs:[['S2','CC6.1'],['ISO','8.5'],['HIP','164.312(d)'],['GDPR','Art.32']],desc:'All administrative and privileged accounts enforce MFA.'},
+{slug:'access.offboarding',name:'Offboarding Within 24 Hours',state:'FAILING',grade:'C',score:58,st:'IMPLEMENTED',reqs:[['S2','CC6.2'],['ISO','5.11']],desc:'Terminated personnel lose all access within 24h.'},
+{slug:'crypto.atRest',name:'Encryption at Rest',state:'PASSING',grade:'A',score:94,st:'IMPLEMENTED',reqs:[['S2','CC6.1'],['ISO','8.24']],desc:'All production data stores encrypt at rest.'},
+{slug:'change.branchProtection',name:'Protected Mainline & Code Review',state:'PASSING',grade:'B',score:82,st:'IMPLEMENTED',reqs:[['S2','CC8.1'],['ISO','8.32']],desc:'Default branches protected; review + CI required.'},
+{slug:'vendor.riskProgram',name:'Vendor Risk Management',state:'STALE',grade:'D',score:44,st:'IN_PROGRESS',reqs:[['S2','CC9.2'],['ISO','5.19'],['GDPR','Art.28']],desc:'Vendors tiered, reviewed on cadence.'}];
+var CHAINS={};
+CONTROLS.forEach(function(c){var n=5,arr=[];for(var i=1;i<=n;i++){arr.push({seq:i,st:(c.slug==='access.offboarding'&&i===1)?'FAIL':'PASS',ch:rhex(),at:Date.now()-i*2*DAY});}arr.reverse();CHAINS[c.slug]=arr;});
+var TASKS=[
+{t:'Deprovision terminated employees immediately',p:'CRITICAL',s:'OPEN',src:'test',re:true},
+{t:'Verify EU subject facts for GDPR Art.33 clock',p:'HIGH',s:'OPEN',src:'incident'},
+{t:'Evidence quality below gate: vendor.riskProgram',p:'HIGH',s:'OPEN',src:'gap'},
+{t:'Stripe annual vendor review',p:'MEDIUM',s:'IN_PROGRESS',src:'vendor'},
+{t:'Rotate Okta API token',p:'MEDIUM',s:'DONE',src:'manual',v:true},
+{t:'Upload Q2 access-review evidence',p:'MEDIUM',s:'DONE',src:'gap'}];
+var POLICIES=[{t:'Access Control Policy',v:3,st:'APPROVED',ai:false},{t:'Information Security Policy',v:1,st:'IN_REVIEW',ai:true},{t:'Encryption Policy',v:2,st:'APPROVED',ai:false},{t:'Incident Response Plan',v:2,st:'APPROVED',ai:false}];
+var QUEST=[
+{q:'Is MFA required for administrative access?',st:'AUTO_DRAFTED',c:0.96,a:'Yes. All administrative and privileged accounts enforce MFA, verified daily against Okta (12/12 enrolled).',ci:[{t:'policy',n:'Access Control Policy v1',ex:'Privileged accounts enforce MFA [CC6.1].'}]},
+{q:'How long do you retain audit logs?',st:'AUTO_DRAFTED',c:0.91,a:'Audit logs retained 12 months; 90 days immediately queryable.',ci:[{t:'policy',n:'Logging Policy v2'}]},
+{q:'Do you have a SOC 2 Type II report?',st:'AUTO_DRAFTED',c:0.89,a:'Our most recent SOC 2 Type II report covers the period ending Dec 2024, available under NDA.',ci:[]},
+{q:'Where is customer data stored geographically?',st:'AI_DRAFTED',c:0.42,a:null,ci:[{t:'gap',n:'No data-residency statement found'}]},
+{q:'Describe your incident response process.',st:'STALE',c:0.88,a:'Seven-state machine; per-jurisdiction notification deadlines.',ci:[{t:'policy',n:'Incident Response Plan v2'}]}];
+var VENDORS=[{n:'Stripe',tier:'CRITICAL',score:88,cert:'SOC2 exp 28d'},{n:'Datadog',tier:'HIGH',score:61,cert:'ISO expired'},{n:'Acme Legal',tier:'LOW',score:74,cert:'—'}];
+var DSARS=[{type:'ACCESS',st:'VERIFIED',due:Date.now()+12*DAY},{type:'ERASE',st:'VERIFYING',due:Date.now()+28*DAY},{type:'ACCESS',st:'REVIEW',due:Date.now()+3*DAY},{type:'PORT',st:'DELIVERED',due:Date.now()+5*DAY},{type:'ACCESS',st:'REVIEW',due:Date.now()-2*DAY,over:true}];
+var INC={title:'Suspected credential stuffing on customer portal',sev:'HIGH',st:'TRIAGE',obs:[{a:'GDPR_DPA',s:'GDPR Art.33',dl:Date.now()+41*36e5},{a:'AG_US-CO',s:'C.R.S. 6-1-716',dl:Date.now()+29*DAY},{a:'HHS',s:'HIPAA 164.408',dl:Date.now()+59*DAY}]};
+var RADAR=[{j:'US-CO',sum:'SB 24-10 amends breach deadline 30d to 21d (biometric)',st:'PENDING_REVIEW'},{j:'EU',sum:'EDPB guidance on Art.33 without undue delay',st:'VERIFIED'},{j:'US-NY',sum:'DFS Part 500 amendment - 72h threshold lowered',st:'APPLIED'}];
+var SUBSYS={api:0.99,mcp:1,connectors:0.92,check_runner:0.97,llm:1,temporal:1,sla_timers:0.98,review_queue:0.95,ethics_service:1};
+var RIAJ=[{c:'US-CO',n:'Colorado',rel:0.9},{c:'US-CA',n:'California',rel:0.9},{c:'EU',n:'European Union',rel:0.85},{c:'GB',n:'United Kingdom',rel:0.9}];
+var REVIEWQ=[{q:'FRAMEWORK_CONTENT',t:'SOC2 CC7.4 - Incident response',p:'HIGH'},{q:'MATRIX_PROPOSAL',t:'US-CO: SB 24-10 amends breach rule',p:'CRITICAL'},{q:'REG_CHANGE',t:'US-NY: DFS Part 500 72h threshold',p:'HIGH'},{q:'RIA_DRIFT',t:'RIA extraction drift: rejection_rate 0.34',p:'CRITICAL'}];
+var TRUST={slug:'acme',sections:[{t:'Security program',b:'Unified controls across SOC 2, ISO 27001, HIPAA and GDPR, continuously tested with hash-chained evidence.'},{t:'Penetration testing',b:'Annual third-party penetration test; latest report available under NDA.'},{t:'Privacy',b:'DSARs handled within Art. 12 timelines; DPO reachable at dpo@acme.test.'}],docs:[{n:'Security Overview (public)',pub:true},{n:'SOC 2 Type II Report (NDA)',pub:false}]};
+/* ---------- live feed ---------- */
+var POOL=[['control.test.passed','✅'],['control.test.failed','❌'],['evidence.created','🧾'],['gap.detected','⚠️'],['policy.published','📄'],['regchange.applied','📡'],['trust.nda.signed','🛡'],['privacy_request.created','⛨']];
+var feed=[];
+function pushFeed(){var p=POOL[Math.floor(Math.random()*POOL.length)];feed.unshift({t:p[0],i:p[1],at:new Date()});feed=feed.slice(0,30);var el=document.getElementById('feedList');if(el)el.innerHTML=feedRows();}
+function feedRows(){return feed.map(function(e){return '<div class="frow"><span class="t">'+tstr(e.at)+'</span><span>'+e.i+'</span><span style="flex:1">'+e.t+'</span></div>';}).join('');}
+/* ---------- shared render bits ---------- */
+function ring(p,s){s=s||112;var r=s/2-9,c=2*Math.PI*r,col=p>=80?'var(--pass)':p>=50?'var(--warn)':'var(--fail)';
+return '<div class="ring" style="width:'+s+'px;height:'+s+'px"><svg width="'+s+'" height="'+s+'"><circle cx="'+(s/2)+'" cy="'+(s/2)+'" r="'+r+'" stroke="var(--mu2)" stroke-width="9" fill="none"/><circle cx="'+(s/2)+'" cy="'+(s/2)+'" r="'+r+'" stroke="'+col+'" stroke-width="9" fill="none" stroke-linecap="round" stroke-dasharray="'+c+'" stroke-dashoffset="'+(c*(1-p/100))+'"/></svg><div class="c"><b>'+p+'%</b></div></div>';}
+function fmtClock(ms){if(ms<=0)return'OVERDUE';var h=Math.floor(ms/36e5),m=Math.floor(ms%36e5/6e4),s=Math.floor(ms%6e4/1e3);return h>24?Math.floor(h/24)+'d '+h%24+'h':('0'+h).slice(-2)+':'+('0'+m).slice(-2)+':'+('0'+s).slice(-2);}
+/* ---------- screens ---------- */
+function home(){var out='<div class="ph"><div><h1>Good day, Sarah</h1><div class="ps">'+new Date().toDateString()+'</div></div><span class="badge b-pass"><span class="dot pass"></span> Brain live</span></div>';
+out+='<div class="g g4" style="margin-bottom:12px">';
+Object.keys(FW).forEach(function(k){var f=FW[k];out+='<div class="card" style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:16px">'+ring(f.p)+'<div style="text-align:center"><div style="font-weight:550">'+f.n+'</div><div class="xs muted">'+f.d+'/'+f.t+' satisfied</div></div>'+(f.p<75?B('b-warn',(f.t-f.d)+' gaps'):'')+'</div>';});
+out+='</div><div class="g gm"><div class="g g3" style="align-content:start">';
+out+='<div class="card cb"><div class="xs" style="font-weight:650;text-transform:uppercase;color:var(--fg3);margin-bottom:8px">Tasks</div>'+[['Critical',3],['High',5],['Medium',9],['Low',4]].map(function(x){return '<div class="qbar"><span style="flex:1">'+x[0]+'</span><b class="tab">'+x[1]+'</b></div>';}).join('')+'<a href="#/tasks" class="sm" style="color:var(--info)">View all →</a></div>';
+out+='<div class="card cb"><div class="xs" style="font-weight:650;text-transform:uppercase;color:var(--fg3);margin-bottom:8px">Evidence quality</div>'+[['A',62,'var(--pass)'],['B',28,'var(--pass)'],['C',7,'var(--warn)'],['D',2,'var(--warn)'],['F',1,'var(--fail)']].map(function(x){return '<div class="qbar"><span style="width:12px;font-weight:650">'+x[0]+'</span><div class="tr"><div class="fl" style="width:'+x[1]+'%;background:'+x[2]+'"></div></div><span class="tab" style="width:24px;text-align:right">'+x[1]+'</span></div>';}).join('')+'</div>';
+out+='<div class="card cb"><div class="xs" style="font-weight:650;text-transform:uppercase;color:var(--fg3);margin-bottom:8px">Reg radar</div>'+RADAR.map(function(r){return '<div class="sm" style="margin-bottom:7px"><span class="muted xs">'+r.j+' · </span>'+esc(r.sum.slice(0,44))+'…</div>';}).join('')+'<a href="#/radar" class="sm" style="color:var(--info)">All →</a></div>';
+out+='</div><div class="card" style="display:flex;flex-direction:column;max-height:420px"><div class="cti">Live activity <span class="xs muted">streaming</span></div><div id="feedList" style="overflow-y:auto;flex:1">'+feedRows()+'</div><a href="#/brain" style="border-top:1px solid var(--bd);padding:9px;text-align:center;font-size:12px;color:var(--fg3)">View Brain →</a></div></div>';
+return out;}
+function controls(){var out='<div class="ph"><h1>Controls</h1><span class="xs muted">one control → four frameworks</span></div><div class="card"><table class="tbl"><thead><tr><th>Control</th><th>Frameworks</th><th>Test</th><th>Grade</th><th></th></tr></thead><tbody>';
+CONTROLS.forEach(function(c){out+='<tr><td style="font-weight:550">'+c.name+'</td><td>'+c.reqs.map(function(r){return '<span class="badge b-zinc" style="margin-right:3px">'+r[0]+' '+r[1]+'</span>';}).join('')+'</td><td>'+B({PASSING:'b-pass',FAILING:'b-fail',STALE:'b-warn'}[c.state],c.state)+'</td><td>'+B(c.score>=75?'b-pass':c.score>=50?'b-warn':'b-fail',c.grade)+'</td><td><a href="#/controls/'+c.slug+'"><button class="btn btn-o">Open</button></a></td></tr>';});
+return out+'</tbody></table></div>';}
+function controlDetail(slug){var c=CONTROLS.filter(function(x){return x.slug===slug;})[0];if(!c)return '<div class="empty">Not found</div>';var ch=CHAINS[slug]||[];
+var out='<a href="#/controls" class="xs muted">← Controls</a><div class="ph" style="margin-top:8px"><div><h1>'+c.name+'</h1><div class="ps">'+c.desc+'</div></div><div style="display:flex;gap:10px;align-items:center">'+B(c.score>=75?'b-pass':'b-fail',c.grade+' · '+c.score)+'<button class="btn btn-p" onclick="alert(\'Test started — evidence will append to chain\')">Run test now</button></div></div>';
+out+='<div style="display:flex;gap:8px;margin-bottom:12px">'+B(c.st==='IMPLEMENTED'?'b-pass':'b-info',c.st)+B({PASSING:'b-pass',FAILING:'b-fail',STALE:'b-warn'}[c.state],'test: '+c.state)+'<div style="flex:1"></div>'+c.reqs.map(function(r){return '<span class="badge b-zinc">'+r[0]+' '+r[1]+'</span>';}).join('')+'</div>';
+out+='<div class="card"><div class="cti">Evidence chain — tamper-evident <button class="btn btn-o" onclick="alert(\'Chain verified ✓ 5 links\')">Verify chain 🔒</button></div><div class="cb">';
+ch.forEach(function(e,i){out+='<div class="chain'+(e.st==='FAIL'?' f':'')+'"><div class="chead"><span class="mono" style="color:'+(e.st==='PASS'?'var(--pass)':'var(--fail)')+'">'+(e.st==='PASS'?'✓':'✗')+'</span><span class="muted tab">#'+e.seq+'</span><span style="flex:1">Scheduled evidence run</span><span class="xs muted">'+dstr(e.at)+'</span><span class="mono muted">chain '+e.ch.slice(0,8)+'…</span></div></div>';});
+return out+'</div></div>';}
+function tasks(){var out='<div class="ph"><h1>Tasks</h1><span class="xs muted">hourly verification sweep auto-reopens failing DONE tasks</span></div><div class="card" style="margin-bottom:12px"><div class="cti">Open</div>';
+TASKS.filter(function(t){return t.s!=='DONE';}).forEach(function(t){out+='<div class="row">'+B({CRITICAL:'b-fail',HIGH:'b-warn',MEDIUM:'b-info',LOW:'b-zinc'}[t.p],t.p)+'<div style="flex:1"><div style="font-weight:550;font-size:13px">'+esc(t.t)+'</div><div class="xs muted">'+t.src+(t.re?' <span style="color:var(--fail)">⚠ auto-verify failed — reopened</span>':'')+'</div></div><button class="btn btn-s" onclick="this.textContent=\'done ✓\'">Mark done</button></div>';});
+out+='</div><div class="card"><div class="cti">Completed — auto-verification</div>';
+TASKS.filter(function(t){return t.s==='DONE';}).forEach(function(t){out+='<div class="row"><span style="color:var(--pass)">✓</span><div style="flex:1">'+esc(t.t)+'</div>'+(t.v?B('b-warn','⏳ auto-verifying'):B('b-pass','verified'))+'</div>';});
+return out+'</div>';}
+function policies(){var out='<div class="ph"><h1>Policies — AI generation & versioning</h1><button class="btn btn-p" onclick="alert(\'Draft queued → IN_REVIEW. AI never auto-publishes.\')">+ Draft policy (AI)</button></div><div class="card"><table class="tbl"><thead><tr><th>Policy</th><th>v</th><th>Status</th></tr></thead><tbody>';
+POLICIES.forEach(function(p){out+='<tr><td style="font-weight:550">'+p.t+(p.ai?' '+B('b-draft','AI draft'):'')+'</td><td class="tab">v'+p.v+'</td><td>'+B(p.st==='APPROVED'?'b-pass':'b-warn',p.st)+'</td></tr>';});
+return out+'</tbody></table></div>';}
+function quest(){return '<div class="ph"><h1>Questionnaires — Northwind Bank</h1>'+B('b-info','7 to review')+'</div><div class="card"><div class="row"><div style="flex:1"><div style="font-weight:550">Northwind Bank — Vendor Security Assessment</div><div class="xs muted">5 questions · 4 in review queue</div></div><a href="#/questionnaires/q1/review"><button class="btn btn-p">Open review →</button></a></div></div>';}
+function questReview(){var out='<div class="ph"><h1>Northwind Bank — Security Review</h1><div style="display:flex;gap:8px">'+B('b-pass','calibration healthy')+B('b-info','library coverage 71%')+'</div></div>';
+out+='<div class="rev"><div class="pn lf">';
+[['Auto-drafted',['AUTO_DRAFTED'],'🟢'],['Review',['AI_DRAFTED'],'🟡'],['Mandatory',['MANDATORY'],'🔴'],['Stale',['STALE'],'⚪']].forEach(function(g){var qs=QUEST.filter(function(q){return g[1].indexOf(q.st)>=0;});if(!qs.length)return;out+='<div class="gh">'+g[2]+' '+g[0]+' ('+qs.length+')</div>';qs.forEach(function(q,i){out+='<button class="qi'+(i===0&&g[1].indexOf(QUEST[0].st)>=0?' on':'')+'"><span class="muted tab" style="width:32px">'+(q.c!=null?q.c.toFixed(2):'—')+'</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left">'+esc(q.q)+'</span></button>';});});
+out+='</div><div class="pn cn"><div class="xs" style="text-transform:uppercase;color:var(--fg3)">Q1 of 4</div><h2 style="margin:6px 0 12px">'+esc(QUEST[0].q)+'</h2><div style="border:1px solid var(--bd);background:var(--sf);border-radius:10px;padding:16px"><div style="display:flex;gap:8px;margin-bottom:9px">'+B('b-pass','confidence 0.96')+B('b-pass','AUTO_DRAFTED')+'</div><p style="white-space:pre-wrap;font-size:13px">'+esc(QUEST[0].a)+'</p></div><div style="display:flex;gap:8px;margin-top:16px"><button class="btn btn-s" onclick="alert(\'Approved — saved to library (flywheel +1)\')">Approve <kbd>A</kbd></button><button class="btn btn-o">Edit <kbd>E</kbd></button><button class="btn btn-d" onclick="alert(\'Rejected — negative example captured\')">Reject <kbd>R</kbd></button></div></div>';
+out+='<div class="pn rt"><div class="xs" style="text-transform:uppercase;color:var(--fg3);margin-bottom:9px">Sources</div>'+QUEST[0].ci.map(function(c){return '<div class="src"><div class="xs muted">'+(c.t==='policy'?'📄':'⚠')+' '+B(c.t==='gap'?'b-fail':'b-zinc',c.t)+' '+esc(c.n)+'</div>'+(c.ex?'<div class="ex">'+esc(c.ex)+'</div>':'')+'</div>';}).join('')+'</div></div>';
+return out;}
+function vendors(){var out='<div class="ph"><h1>Vendors</h1><button class="btn btn-p" onclick="alert(\'Vendor added — tier computed automatically\')">+ Add vendor</button></div><div class="card"><table class="tbl"><thead><tr><th>Vendor</th><th>Tier</th><th>Posture</th><th>Cert</th></tr></thead><tbody>';
+VENDORS.forEach(function(v){out+='<tr><td style="font-weight:550">'+v.n+'</td><td>'+B({CRITICAL:'b-fail',HIGH:'b-warn',LOW:'b-zinc'}[v.tier],v.tier)+'</td><td class="tab">'+v.score+'</td><td class="xs muted">'+v.cert+'</td></tr>';});
+return out+'</tbody></table></div>';}
+function privacy(){var out='<div class="ph"><h1>Privacy / DSAR — GDPR workflows</h1></div>';
+if(DSARS.some(function(d){return d.over;}))out+='<div class="flash" style="border-color:#dc26264d;background:#dc26260d;color:var(--fail)">⚠ 1 request past its Art.12(3) deadline.</div>';
+out+='<div class="card"><div class="cti">DSAR inbox</div>';
+DSARS.forEach(function(d){out+='<div class="row">'+B({DELIVERED:'b-pass',REVIEW:'b-warn',VERIFIED:'b-info',VERIFYING:'b-zinc'}[d.st],d.st)+'<span style="width:64px;font-weight:550">'+d.type+'</span><div style="flex:1"></div><span class="tab xs" style="'+(d.over?'color:var(--fail);font-weight:650':'color:var(--fg3)')+'">'+(d.over?'OVERDUE':'due '+dstr(d.due))+'</span></div>';});
+return out+'</div>';}
+function incidents(){var out='<div class="ph"><h1>'+INC.title+'</h1><div style="display:flex;gap:8px">'+B('b-fail',INC.sev)+B('b-info',INC.st)+'</div></div>';
+out+='<div class="card cb" style="margin-bottom:12px"><div class="xs" style="font-weight:650;text-transform:uppercase;color:var(--fg3);margin-bottom:8px">IR state machine</div><div class="steps">'+['OPEN','TRIAGE','CONTAINED','ERADICATED','RECOVERED','POSTMORTEM','CLOSED'].map(function(s,i){return '<span class="stp '+(i<=1?'on':'off')+'">'+s+'</span>'+(i<6?'<span class="muted">→</span>':'');}).join('')+'</div></div>';
+out+='<div class="card"><div class="cti">Statutory notification clocks</div>';
+INC.obs.forEach(function(o){out+='<div class="row"><div style="flex:1"><div style="font-weight:550">'+o.a+'</div><div class="xs muted">'+o.s+'</div></div><span class="clock" data-dl="'+o.dl+'"></span>'+B('b-warn','PENDING')+'</div>';});
+out+='</div>';return out;}
+function radar(){var out='<div class="ph"><h1>Regulatory change radar</h1></div><div class="card">';
+RADAR.forEach(function(r){out+='<div class="row"><span class="badge b-zinc">'+r.j+'</span><div style="flex:1">'+esc(r.sum)+'</div>'+B({APPLIED:'b-pass',VERIFIED:'b-info',PENDING_REVIEW:'b-warn'}[r.st],r.st)+'</div>';});
+return out+'</div><div class="xs muted" style="margin-top:10px">Everything downstream of detection is expert-gated (review console).</div>';}
+function ria(){var out='<div class="ph"><h1>Regulatory Intelligence Agent</h1></div><div class="g g2"><div class="card"><div class="cti">Jurisdictions + source reliability</div>';
+RIAJ.forEach(function(j){out+='<div class="row"><span class="mono" style="width:52px">'+j.c+'</span><div style="flex:1">'+j.n+'</div><div style="width:120px;height:6px;background:var(--mu);border-radius:99px"><div style="width:'+(j.rel*100)+'%;height:100%;background:'+(j.rel>=0.85?'var(--pass)':'var(--warn)')+';border-radius:99px"></div></div><span class="tab xs" style="width:36px;text-align:right">'+Math.round(j.rel*100)+'%</span></div>';});
+out+='</div><div class="card"><div class="cti">Extraction drift</div><div class="row">'+B('b-fail','CRITICAL')+'<div style="flex:1">ria / rejection_rate_7d</div><span class="tab xs">0.34 vs 0.15</span></div><div class="row">'+B('b-warn','WARN')+'<div style="flex:1">ria / retrieval_precision</div><span class="tab xs">0.88 vs 0.92</span></div></div></div>';
+return out;}
+function reviewConsole(){var out='<div class="ph"><h1>Review Console — expert gate</h1>'+B('b-fail','4 pending')+'</div><div class="card"><table class="tbl"><thead><tr><th>Queue</th><th>Item</th><th>Priority</th><th></th></tr></thead><tbody>';
+REVIEWQ.forEach(function(r){out+='<tr><td>'+B('b-zinc',r.q)+'</td><td style="font-weight:550">'+r.t+'</td><td>'+B({CRITICAL:'b-fail',HIGH:'b-warn'}[r.p],r.p)+'</td><td><button class="btn btn-s" onclick="alert(\'Approved (four-eyes on CRITICAL: pending second reviewer)\')">Approve</button> <button class="btn btn-d" onclick="alert(\'Rejected\')">Reject</button></td></tr>';});
+return out+'</tbody></table></div>';}
+function auditor(){var out='<div class="ph"><h1>Auditor Portal</h1><span class="xs muted">watermarked · scope-limited · k-anonymized</span></div><div class="g g2"><div class="card cb"><div class="xs" style="font-weight:650;text-transform:uppercase;color:var(--fg3);margin-bottom:8px">Watermarked evidence</div><div class="card cb" style="background:#fff"><b>MFA enrollment (Okta)</b><div class="xs muted" style="margin:5px 0">chain VALID · 5 links · quality 96/100 (A)</div><div class="mono">content 3fa2… · chain 9c1e…</div></div><div class="xs muted" style="margin-top:8px">Every view logged with watermark token.</div></div>';
+out+='<div class="card cb"><div class="xs" style="font-weight:650;text-transform:uppercase;color:var(--fg3);margin-bottom:8px">DSAR metrics (k=5)</div>'+[['2025-01','ACCESS',12,'92%'],['2025-02','ACCESS',9,'89%'],['2025-03','ERASE',3,null]].map(function(r){return '<div class="qbar"><span style="width:60px" class="muted">'+r[0]+'</span><span style="width:60px">'+r[1]+'</span><span class="tab" style="width:40px">n='+r[2]+'</span><span style="flex:1">'+(r[3]?r[3]:'<span class="muted">suppressed (n&lt;5)</span>')+'</span></div>';}).join('')+'</div></div>';
+return out;}
+function trust(){var out='<div class="ph"><h1>Trust Center / '+TRUST.slug+'</h1><button class="btn btn-p" onclick="trustFlow()">Request access →</button></div><div class="card" style="margin-bottom:12px"><div class="cti">Security & compliance overview</div><div class="cb">'+TRUST.sections.map(function(s){return '<div style="margin-bottom:10px"><h2 style="font-size:13px">'+s.t+'</h2><p class="xs muted" style="margin-top:4px">'+s.b+'</p></div>';}).join('')+'</div></div>';
+out+='<div class="card"><div class="cti">Documents</div>'+TRUST.docs.map(function(d){return '<div class="row">'+(d.pub?'📄':'')+'<span style="flex:1">'+d.n+'</span>'+B(d.pub?'b-pass':'b-zinc',d.pub?'public':'NDA required')+'</div>';}).join('')+'</div>';
+return out;}
+function ethics(){return '<div class="ph"><h1>Anonymous Ethics Hotline</h1><span class="xs muted">isolated · no logs · diceware identity</span></div><div class="card" style="max-width:520px;margin:0 auto"><div class="cb"><label class="xs" style="font-weight:550">Category</label><select style="margin:6px 0">'+['FRAUD','ACCOUNTING','HARASSMENT','DISCRIMINATION','SAFETY','REGULATORY','DATA_PRIVACY','OTHER'].map(function(c){return '<option>'+c+'</option>';}).join('')+'</select><label class="xs" style="font-weight:550">Description</label><textarea rows="5" style="margin:6px 0" placeholder="What happened? Your identity is never requested or logged."></textarea><button class="btn btn-p" style="width:100%" onclick="ethSubmit()">Submit anonymously</button><div class="xs muted" style="margin-top:10px">EU 2019/1937: acknowledge ≤7d · feedback ≤3mo.</div></div></div>';}
+function onboarding(){return '<div class="ph"><h1>Onboarding</h1></div><div class="card" style="max-width:560px;margin:0 auto"><div class="cb" style="text-align:center"><div style="font-size:30px">🎉</div><div style="font-weight:600;margin-top:8px">Your compliance program is live</div><div class="g g3" style="margin-top:16px"><div><div style="font-size:22px;font-weight:650" class="tab">14</div><div class="xs muted">controls</div></div><div><div style="font-size:22px;font-weight:650" class="tab">7</div><div class="xs muted">checks</div></div><div><div style="font-size:22px;font-weight:650" class="tab">9.8×</div><div class="xs muted">reqs/control</div></div></div></div></div>';}
+function settings(){return '<div class="ph"><h1>Settings</h1></div><div class="g g2"><div class="card cb">'+[['Name','Acme Corp'],['Industry','SAAS'],['HQ','US'],['Headcount','120']].map(function(r){return '<div class="qbar"><span style="flex:1" class="muted">'+r[0]+'</span><b>'+r[1]+'</b></div>';}).join('')+'</div><div class="card cb"><div class="qbar"><span style="flex:1" class="muted">Tier</span>'+B('b-info','ENTERPRISE (trial)')+'</div><div class="qbar"><span style="flex:1" class="muted">API key</span><span class="mono">cpk_live_9f2e…</span></div></div></div>';}
+function brain(){var comp=96;var out='<div class="ph"><h1>The Brain</h1>'+B('b-pass','composite '+comp+'%')+'</div><div class="g gm"><div><div class="card" style="margin-bottom:12px"><div class="cti">Subsystem health (9)</div><div class="cb">'+Object.keys(SUBSYS).map(function(k){return '<div class="subsys"><span style="width:104px;color:var(--fg2)">'+k.replace(/_/g,' ')+'</span><div class="tr"><div class="fl" style="width:'+(SUBSYS[k]*100)+'%;background:'+(SUBSYS[k]>=0.95?'var(--pass)':'var(--warn)')+'"></div></div><span class="tab muted" style="width:36px;text-align:right">'+Math.round(SUBSYS[k]*100)+'%</span></div>';}).join('')+'</div></div>';
+out+='<div class="card"><div class="cti">Open anomalies</div><div class="row">'+B('b-warn','WARN')+'<div style="flex:1"><b>connector</b> <span class="xs muted">rate · hourly_error_share</span></div><span class="tab xs">0.14 vs 0.02</span></div><div class="row">'+B('b-fail','CRITICAL')+'<div style="flex:1"><b>ria</b> <span class="xs muted">ria-drift · rejection_rate_7d</span></div><span class="tab xs">0.34 vs 0.15</span></div></div></div>';
+out+='<div><div class="card" style="margin-bottom:12px"><div class="cti">ask_brain <span class="badge b-zinc">ops:brain</span></div><div class="cb"><div class="xs muted" style="margin-bottom:6px">› why did connector syncs fail overnight?</div><div class="sm">Ranked hypothesis: Okta token expired 04:12Z (401 burst). Rotate token.</div></div></div><div class="card"><div class="cti">Reflexes (operational only)</div><div class="row">'+B('b-warn','silence_pause')+'<span class="xs muted">paused 1 stale connector</span></div><div class="row">'+B('b-fail','critical_page')+'<span class="xs muted">paged on-call</span></div></div></div></div>';
+return out;}
+function calculator(){return '<div class="ph"><h1>SOC 2 cost calculator</h1></div><div class="g g3" style="margin-bottom:12px">'+[['P10 lean','$41,900'],['P50 typical','$61,400'],['P90 complex','$98,200']].map(function(x){return '<div class="card cb"><div class="xs" style="text-transform:uppercase;color:var(--fg3)">'+x[0]+'</div><div style="font-size:20px;font-weight:650" class="tab">'+x[1]+'</div></div>';}).join('')+'</div><div class="card cb">'+[['Auditor fee',26000],['Internal labor',18400],['Remediation',6000],['Platform (fixed, annual)',11990]].map(function(r){return '<div class="qbar"><span style="flex:1" class="muted">'+r[0]+'</span><b class="tab">$'+r[1].toLocaleString()+'</b></div>';}).join('')+'</div>';}
+function report(){return '<div class="ph"><h1>Executive report — 2025-06</h1><button class="btn btn-o" onclick="alert(\'Exported PDF\')">Export PDF</button></div><div class="g g4" style="margin-bottom:12px">'+[['Risk index','31'],['Evidence quality','82%'],['Gaps closed','14'],['DSAR on-time','91%']].map(function(x){return '<div class="card cb"><div class="xs" style="text-transform:uppercase;color:var(--fg3)">'+x[0]+'</div><div style="font-size:20px;font-weight:650" class="tab">'+x[1]+'</div></div>';}).join('')+'</div><div class="card cb sm" style="line-height:1.7">Risk index fell 37→31; top drivers: vendor evidence staleness (34 pts), offboarding FAILING (28). Evidence quality 82% (B). DSAR on-time 91%. <span class="muted">(AI narrative — every claim references a metric.)</span></div>';}
+function developer(){return '<div class="ph"><h1>Developer / MCP</h1><span class="xs muted">one catalog → REST + MCP + SDKs</span></div><div class="card"><table class="tbl"><thead><tr><th>Tool</th><th>Scope</th><th>Tier</th></tr></thead><tbody>'+[['get_readiness','read:risk',1],['list_controls','read:controls',1],['verify_chain_proof','read:evidence',1],['run_check_now','ops:run-checks',3],['answer_security_question','ai:answer',2],['ask_brain','ops:brain',2]].map(function(r){return '<tr><td class="mono">'+r[0]+'</td><td class="mono">'+r[1]+'</td><td class="tab">T'+r[2]+'</td></tr>';}).join('')+'</tbody></table></div>';}
+/* ---------- modals ---------- */
+function trustFlow(){document.getElementById('modal').innerHTML='<div class="ov" onclick="if(event.target===this)closeM()"><div class="mo"><div class="mh">Mutual NDA — signature</div><div class="mb"><p class="xs muted" style="margin-bottom:9px">Business domain auto-approved. Read & sign to unlock gated docs.</p><label class="xs" style="font-weight:550">Type your full legal name to sign</label><input id="ndaSig" style="margin:6px 0" placeholder="Full legal name"><button class="btn btn-p" style="width:100%" onclick="closeM();alert(\'NDA signed ✓ — gated documents unlocked (15-min presigned URLs)\')">I agree · Sign & get documents</button></div></div></div>';}
+function ethSubmit(){var w=['harbor','quantum','lens','drift','echo','nimbus','fern','slate'];var p=[];for(var i=0;i<8;i++)p.push(w[Math.floor(Math.random()*w.length)]);document.getElementById('modal').innerHTML='<div class="ov" onclick="if(event.target===this)closeM()"><div class="mo"><div class="mh">🔑 Access passphrase — shown ONCE</div><div class="mb"><div class="passp">'+p.join('-')+'</div><div style="border:1px solid #dc26264d;background:#dc26260d;border-radius:8px;padding:10px;font-size:12px;margin-top:12px;color:var(--fail)"><b>Write it down now.</b> It cannot be recovered.</div></div></div></div>';}
+function closeM(){document.getElementById('modal').innerHTML='';}
+/* ---------- nav + router ---------- */
+var NAV=[{g:'Overview',i:[['#/','Home','▣'],['#/brain','The Brain','⬢']]},
+{g:'Compliance',i:[['#/controls','Controls','◇'],['#/tasks','Tasks','✓',7],['#/policies','Policies','▤'],['#/questionnaires','Questionnaires','▦',32]]},
+{g:'Operations',i:[['#/vendors','Vendors','⌂'],['#/privacy','Privacy / DSAR','⛨'],['#/incidents','Incidents','⚠',1],['#/radar','Reg Radar','📡']]},
+{g:'Platform',i:[['#/ria','RIA','🛰'],['#/review','Review Console','🔍',4],['#/trust','Trust Center','🛡'],['#/ethics','Ethics Hotline','🕊'],['#/onboarding','Onboarding','◈'],['#/settings','Settings','⚙']]},
+{g:'Tools',i:[['#/calculator','SOC 2 Calculator','🧮'],['#/report','Executive Report','📊'],['#/developer','Developer / MCP','⌨']]}];
+function buildNav(){document.getElementById('nav').innerHTML=NAV.map(function(g){return '<div class="ng"><div class="nl">'+g.g+'</div>'+g.i.map(function(x){return '<a href="'+x[0]+'" data-h="'+x[0]+'"><span class="ic">'+x[2]+'</span><span style="flex:1">'+x[1]+'</span>'+(x[3]?'<span class="bd">'+x[3]+'</span>':'')+'</a>';}).join('')+'</div>';}).join('');}
+var ROUTES={'#/':home,'#/brain':brain,'#/controls':controls,'#/tasks':tasks,'#/policies':policies,'#/questionnaires':quest,'#/vendors':vendors,'#/privacy':privacy,'#/incidents':incidents,'#/radar':radar,'#/ria':ria,'#/review':reviewConsole,'#/trust':trust,'#/ethics':ethics,'#/onboarding':onboarding,'#/settings':settings,'#/calculator':calculator,'#/report':report,'#/developer':developer};
+function go(){var h=location.hash||'#/';
+document.querySelectorAll('#nav a').forEach(function(a){a.classList.toggle('on',a.getAttribute('data-h')===h);});
+var v=document.getElementById('view');
+try{
+if(h.indexOf('#/controls/')===0){v.innerHTML=controlDetail(h.split('/')[2]);}
+else if(h.indexOf('#/questionnaires/')===0){v.innerHTML=questReview();}
+else{var fn=ROUTES[h]||home;v.innerHTML=fn();}
+if(h==='#/incidents'){startClocks();}
+if(h==='#/'){for(var i=0;i<8;i++)pushFeed();}
+}catch(e){v.innerHTML='<div class="err">RENDER ERROR: '+e.message+'</div>';}
+}
+function startClocks(){var tick=function(){document.querySelectorAll('.clock').forEach(function(el){var ms=+el.getAttribute('data-dl')-Date.now();el.textContent=fmtClock(ms);el.className='clock '+(ms<72e5?'crit':ms<1728e5?'wr':'');});};tick();setInterval(tick,1000);}
+window.addEventListener('hashchange',go);
+buildNav();go();setInterval(pushFeed,3500);
+}catch(e){document.getElementById('view').innerHTML='<div class="err">BOOT ERROR: '+e.message+'</div>';}
+</script>
+</body>
+</html>

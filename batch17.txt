@@ -1,0 +1,95 @@
+### SCHEMA APPEND → add these models to packages/db/prisma/schema.prisma
+```prisma
+// ═══════════ REGULATORY INTELLIGENCE AGENT (RIA) ═══════════
+
+/// A jurisdiction we monitor — countries + sub-national regions beyond US states.
+/// (US states already come from LegislativeSource / the breach matrix.)
+model Jurisdiction {
+id String @id @default(cuid())
+code String @unique // "EU", "GB", "AU", "CA-ON", "SG"
+name String
+country String
+region String // EU | UK | APAC | NA | LATAM
+legalTradition String @default("COMMON") // COMMON | CIVIL | MIXED
+primaryLanguage String @default("en")
+frameworks String[] @default([]) // mapped framework codes
+enabled Boolean @default(true)
+createdAt DateTime @default(now())
+sources RegSourceCountry[]
+@@index([region, enabled])
+}
+
+enum SourceKind { GAZETTE API RSS WEB PDF }
+
+/// A regulatory source within a jurisdiction — gazette, regulator site, feed.
+model RegSourceCountry {
+id String @id @default(cuid())
+jurisdictionId String
+name String
+kind SourceKind @default(WEB)
+url String
+checkFrequencyCron String @default("0 8 * * *")
+parserType String @default("GENERIC_WEB")
+reliability Float @default(0.5) // rolling extraction-accuracy 0..1 (learning loop)
+discoveredBy String @default("MANUAL") // MANUAL | CRAWLER
+enabled Boolean @default(true)
+lastCheckedAt DateTime?
+lastContentHash String?
+jurisdiction Jurisdiction @relation(fields: [jurisdictionId], references: [id])
+crawlTasks CrawlTask[]
+@@index([jurisdictionId, enabled])
+}
+
+/// Autonomous crawl task — tracks discovery + extraction runs.
+model CrawlTask {
+id String @id @default(cuid())
+sourceCountryId String
+status String @default("PENDING") // PENDING | RUNNING | DONE | FAILED | BLOCKED
+depth Int @default(1)
+urlsFound Int @default(0)
+docsExtracted Int @default(0)
+error String?
+startedAt DateTime?
+finishedAt DateTime?
+createdAt DateTime @default(now())
+source RegSourceCountry @relation(fields: [sourceCountryId], references: [id])
+@@index([status, createdAt])
+}
+
+/// Knowledge-graph node linking a regulatory change to requirements/controls.
+/// jurisdictionCode is a plain code string (no FK — robust to missing rows).
+model RegKnowledgeNode {
+id String @id @default(cuid())
+jurisdictionCode String
+regChangeId String?
+nodeType String // REGULATION | REQUIREMENT | CONTROL | GUIDANCE
+refCode String // "GDPR Art.32", "UK-DPA s66", "APP 11"
+title String
+linkedRequirementId String? // FrameworkRequirement.id when mapped
+linkedControlTemplateId String? // ControlTemplate.id when mapped
+confidence Float @default(0.5)
+verified Boolean @default(false)
+createdAt DateTime @default(now())
+@@index([jurisdictionCode, nodeType])
+@@index([linkedRequirementId])
+@@index([regChangeId])
+}
+
+/// Learning signal — expert review feedback drives calibration.
+model RegLearningSignal {
+id String @id @default(cuid())
+jurisdictionCode String
+sourceCountryId String?
+changeType String
+extractedConfidence Float
+expertDecision String // APPROVED | REJECTED | MODIFIED
+impactPredicted String? // INFO | MINOR | MAJOR | CRITICAL
+impactActual String?
+routingCorrect Boolean?
+reviewerNote String?
+createdAt DateTime @default(now())
+@@index([jurisdictionCode, changeType, createdAt])
+@@index([sourceCountryId, createdAt])
+}
+```
+### END SCHEMA APPEND

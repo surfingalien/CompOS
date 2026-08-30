@@ -1,0 +1,1019 @@
+### FILE: apps/api/src/handlers/platform.ts
+```typescript
+// Batch 16 — platform observability + regulatory-governance surfaces.
+// Org-scoped reads go through rlsClient (RLS binds); platform/global tables
+// (StateBreachRule, FrameworkRequirement, RegChange, ControlTemplate, …) have
+// no orgId and are read with plain prisma.
+import { FastifyInstance } from "fastify";
+import { prisma, rlsClient } from "@db/client";
+import { controlTestState, suggestMappingsForNewFramework } from "@core";
+import { connectorFor } from "@skills";
+const CONNECTOR_TYPES = ["OKTA", "AWS", "GITHUB", "BAMBOOHR"] as const;
+export async function platformHandlers(app: FastifyInstance) {
+// ── EVIDENCE LIBRARY ─────────────────────────────────────────────
+app.get("/v1/evidence-library", async (req) => {
+const { controlSlug, sourceType, limit } = req.query as
+{ controlSlug?: string; sourceType?: string; limit?: string };
+return rlsClient().asOrg(req.org!.id, async (tx) => {
+const rows = await tx.evidence.findMany({
+where: {
+...(controlSlug ? { control: { slug: controlSlug } } : {}),
+...(sourceType ? { sourceType: sourceType as never } : {}),
+},
+include: {
+control: { select: { slug: true, name: true } },
+quality: true, integration: { select: { type: true } },
+},
+orderBy: { collectedAt: "desc" },
+take: Number(limit ?? 100),
+});
+return rows.map((e) => ({
+id: e.id, sequence: e.sequence, title: e.title,
+controlSlug: e.control.slug, controlName: e.control.name,
+sourceType: e.sourceType, integrationType: e.integration?.type ?? null,
+collectedAt: e.collectedAt.toISOString(),
+expiresAt: e.expiresAt?.toISOString() ?? null,
+contentHash: e.contentHash, chainHash: e.chainHash,
+quality: e.quality ? { score: e.quality.score, grade: e.quality.grade } : null,
+}));
+});
+});
+// ── TESTS LIST ───────────────────────────────────────────────────
+app.get("/v1/tests", async (req) =>
+rlsClient().asOrg(req.org!.id, async (tx) => {
+const tests = await tx.controlTest.findMany({
+include: {
+control: { select: { slug: true, name: true } },
+runs: { orderBy: { startedAt: "desc" }, take: 30 },
+},
+});
+return tests.map((t) => ({
+id: t.id, checkId: (t.check as { checkId?: string }).checkId ?? t.id,
+name: t.name, schedule: t.schedule, enabled: t.enabled,
+controlSlug: t.control.slug, controlName: t.control.name,
+lastRunAt: t.lastRunAt?.toISOString() ?? null,
+state: controlTestState(t.runs, 90),
+recentRuns: t.runs.slice(0, 5).map((r) =>
+({ status: r.status, at: r.startedAt.toISOString() })),
+}));
+}));
+// ── RISK REGISTER ────────────────────────────────────────────────
+app.get("/v1/risks", async (req) =>
+rlsClient().asOrg(req.org!.id, async (tx) => {
+const risks = await tx.risk.findMany({
+include: { owner: { include: { user: { select: { name: true } } } },
+controls: { include: { control: { select: { slug: true, name: true } } } } },
+orderBy: [{ residualImpact: "desc" }, { createdAt: "desc" }],
+});
+return risks.map((r) => ({
+id: r.id, title: r.title, category: r.category,
+inherent: r.inherentLikelihood * r.inherentImpact,
+residual: (r.residualLikelihood ?? r.inherentLikelihood) *
+(r.residualImpact ?? r.inherentImpact),
+treatment: r.treatment,
+owner: r.owner?.user.name ?? null,
+nextReviewAt: r.nextReviewAt?.toISOString() ?? null,
+linkedControls: r.controls.map((c) => c.control),
+}));
+}));
+// ── INTEGRATIONS: connected + connector catalog + processing ─────
+app.get("/v1/integrations", async (req) => {
+const connected = await rlsClient().asOrg(req.org!.id, async (tx) =>
+tx.integration.findMany({
+select: { id: true, type: true, status: true, lastSyncAt: true,
+syncError: true, config: true },
+}));
+// Connector catalog — what each connector collects & which controls it feeds
+const catalog: { type: string; specs: { dataType: string; title: string;
+freshnessDays: number; controls: string[]; expectStable: boolean }[] }[] = [];
+for (const type of CONNECTOR_TYPES) {
+try {
+const specs = connectorFor(type).specs();
+catalog.push({ type, specs: specs.map((s) => ({
+dataType: s.dataType, title: s.title, freshnessDays: s.freshnessDays,
+controls: s.controlTemplateIds, expectStable: s.expectStable ?? false })) });
+} catch { /* connector not registered */ }
+}
+return { connected, catalog,
+processing: [
+"1. connector.collect(dataType) fetches a normalized snapshot",
+"2. contentHash = sha256(canonical items) — drift-detection key",
+"3. Diff vs last IntegrationSnapshot; unchanged → skip (no evidence churn)",
+"4. Changed → appendEvidence() into the control's hash chain (single tx)",
+"5. If expectStable && changed → create a drift review task",
+] };
+});
+// ── 50-STATE BREACH MATRIX (read) ────────────────────────────────
+app.get("/v1/breach-matrix", async (req) => {
+const { verification, jurisdiction } = req.query as
+{ verification?: string; jurisdiction?: string };
+const rules = await prisma.stateBreachRule.findMany({
+where: {
+...(verification ? { verificationStatus: verification } : {}),
+...(jurisdiction ? { id: jurisdiction } : {}),
+},
+orderBy: { id: "asc" },
+});
+return rules.map((r) => ({
+code: r.id, name: r.name, citation: r.citation,
+deadlineDays: r.deadlineDays, notifyResidents: r.notifyResidents,
+agThreshold: r.agThreshold, creditAgencyThreshold: r.creditAgencyThreshold,
+otherAgencies: r.otherAgencies, harmGate: r.harmGate,
+encryptionSafeHarbor: r.encryptionSafeHarbor,
+verificationStatus: r.verificationStatus,
+compiledConfidence: r.compiledConfidence, version: r.version,
+lastVerifiedAt: r.lastVerifiedAt?.toISOString() ?? null,
+}));
+});
+// ── PROPOSE A RULE AMENDMENT (manual correction) ─────────────────
+// Creates a MatrixAmendmentProposal anchored to a synthetic "manual" bill,
+// so it flows through the SAME MATRIX_PROPOSAL review queue as legislative
+// amendments. Experts approve in the review console; never edit the rule row.
+app.post("/v1/breach-matrix/:code/propose", async (req, reply) => {
+const { code } = req.params as { code: string };
+const { changes, effectiveAt, note } = req.body as {
+changes: { field: string; to: unknown }[]; effectiveAt?: string; note?: string };
+const rule = await prisma.stateBreachRule.findUnique({ where: { id: code } });
+if (!rule) return reply.code(404).send({ title: "Rule not found", status: 404 });
+if (!changes?.length)
+return reply.code(400).send({ title: "No changes provided", status: 400 });
+const ts = Date.now();
+const bill = await prisma.trackedBill.create({ data: {
+sourceId: "MANUAL", stateCode: code, billNumber: "MANUAL-AMENDMENT",
+session: `manual-${ts}`, externalRef: `manual:${code}:${ts}`,
+title: `Manual amendment proposal for ${code}`,
+relevanceScore: 1, relevancePath: "MANUAL", stage: "ENACTED", status: "PROPOSED",
+} });
+const allowed = new Set(["deadlineDays", "notifyResidents", "agThreshold",
+"creditAgencyThreshold", "otherAgencies", "harmGate",
+"encryptionSafeHarbor", "substituteNoticeAllowed"]);
+const clean = changes.filter((c) => allowed.has(c.field));
+const current = { deadlineDays: rule.deadlineDays, notifyResidents: rule.notifyResidents,
+agThreshold: rule.agThreshold, creditAgencyThreshold: rule.creditAgencyThreshold,
+otherAgencies: rule.otherAgencies, harmGate: rule.harmGate,
+encryptionSafeHarbor: rule.encryptionSafeHarbor };
+const proposed = { ...current };
+for (const c of clean) (proposed as Record<string, unknown>)[c.field] = c.to;
+const proposal = await prisma.matrixAmendmentProposal.create({ data: {
+billId: bill.id, stateRuleId: rule.id,
+proposed: proposed as object,
+diff: clean.map((c) => ({ field: c.field,
+from: (current as Record<string, unknown>)[c.field], to: c.to })) as object,
+effectiveAt: effectiveAt ? new Date(effectiveAt) : null,
+extractorConfidence: 1.0, reviewerNote: note ?? "Manual amendment",
+} });
+return reply.code(201).send({ proposalId: proposal.id, status: proposal.status,
+note: "Queued for expert review (MATRIX_PROPOSAL). The rule updates only after approval." });
+});
+// ── CONTROL FRAMEWORK: requirements + verification + mappings ────
+app.get("/v1/framework/requirements", async (req) => {
+const { framework } = req.query as { framework?: string };
+const reqs = await prisma.frameworkRequirement.findMany({
+where: framework ? { framework: { code: framework } } : {},
+include: {
+framework: { select: { code: true, name: true, isPublished: true } },
+_count: { select: { controlMappings: true } },
+},
+orderBy: [{ frameworkId: "asc" }, { code: "asc" }],
+});
+return reqs.map((r) => ({
+id: r.id, framework: r.framework.code, frameworkName: r.framework.name,
+frameworkPublished: r.framework.isPublished,
+code: r.code, title: r.title, category: r.category, kind: r.kind,
+satisfiedByWorkflow: r.satisfiedByWorkflow,
+verified: r.verified, verifiedBy: r.verifiedBy,
+controlMappingCount: r._count.controlMappings,
+}));
+});
+app.get("/v1/framework/templates", async () => {
+const templates = await prisma.controlTemplate.findMany({ orderBy: { id: "asc" } });
+return templates.map((t) => ({
+id: t.id, name: t.name, category: t.category, description: t.description,
+satisfiedBy: t.satisfiedBy, checkIds: t.checkIds, policyTypes: t.policyTypes,
+mappings: (t.mappings as { framework: string; code: string; confidence: number }[]),
+}));
+});
+// Propose mappings when an org adds a framework — expert accepts/rejects.
+app.post("/v1/framework/mappings/suggest", async (req) => {
+const { frameworkId } = req.body as { frameworkId: string };
+return suggestMappingsForNewFramework(req.org!.id, frameworkId);
+});
+// ── REGULATORY RADAR: changes + sources + proposals ─────────────
+app.get("/v1/radar/changes", async (req) => {
+const { status, limit } = req.query as { status?: string; limit?: string };
+const changes = await prisma.regChange.findMany({
+where: status ? { status: status as never } : {},
+include: {
+sourceDocument: { select: { title: true, url: true, docType: true } },
+impacts: { include: {
+requirement: { select: { code: true, title: true } },
+framework: { select: { code: true } } } },
+},
+orderBy: { createdAt: "desc" }, take: Number(limit ?? 50),
+});
+return changes.map((c) => ({
+id: c.id, changeType: c.changeType, jurisdiction: c.jurisdiction,
+summary: c.summary, effectiveAt: c.effectiveAt?.toISOString() ?? null,
+status: c.status, extracted: c.extracted,
+source: { title: c.sourceDocument.title, url: c.sourceDocument.url,
+docType: c.sourceDocument.docType },
+impacts: c.impacts.map((i) => ({
+framework: i.framework.code, requirement: i.requirement?.code ?? null,
+requirementTitle: i.requirement?.title ?? null,
+impactLevel: i.impactLevel, rationale: i.rationale,
+suggestedAction: i.suggestedAction,
+})),
+}));
+});
+app.get("/v1/radar/sources", async () => {
+const [reg, legi] = await Promise.all([
+prisma.regSource.findMany({ orderBy: { name: "asc" } }),
+prisma.legislativeSource.findMany({ orderBy: { stateCode: "asc" } }),
+]);
+return {
+federal: reg.map((s) => ({ name: s.name, authority: s.authority,
+jurisdiction: s.jurisdiction, parser: s.parserType, enabled: s.enabled,
+lastCheckedAt: s.lastCheckedAt?.toISOString() ?? null })),
+state: legi.map((s) => ({ stateCode: s.stateCode, strategy: s.strategy,
+sessionCycle: s.sessionCycle, watchSections: s.watchSections,
+enabled: s.enabled, lastPolledAt: s.lastPolledAt?.toISOString() ?? null })),
+};
+});
+app.get("/v1/radar/proposals", async () => {
+const proposals = await prisma.matrixAmendmentProposal.findMany({
+include: { bill: { select: { billNumber: true, stateCode: true, title: true } },
+stateRule: { select: { name: true, citation: true } } },
+orderBy: { createdAt: "desc" }, take: 50,
+});
+return proposals.map((p) => ({
+id: p.id, status: p.status,
+state: p.bill.stateCode, rule: p.stateRule.name,
+bill: p.bill.billNumber, billTitle: p.bill.title,
+changes: p.diff, effectiveAt: p.effectiveAt?.toISOString() ?? null,
+confidence: p.extractorConfidence, createdAt: p.createdAt.toISOString(),
+}));
+});
+}
+```
+### END FILE
+### FILE: apps/api/src/index.ts
+```typescript
+// OVERRIDE (batch 16) — batch-9 base + platformHandlers registered inside
+// the eitherAuth plugin (session OR API key).
+import Fastify from "fastify";
+import cookie from "@fastify/cookie";
+import cors from "@fastify/cors";
+import { mountCatalogRoutes } from "./routes/catalogRest";
+import { brainRoutes } from "./routes/brain";
+import { brainStreamRoutes } from "./routes/brainStream";
+import { auditorRoutes, auditorGdprRoutes } from "./routes/auditor";
+import { trustRoutes } from "./routes/trust";
+import { reviewRoutes } from "./routes/review";
+import { ethicsEventsRoutes } from "./routes/ethics-events";
+import { controlHandlers } from "./handlers/controls";
+import { reviewHandlers } from "./handlers/questionnaireReview";
+import { platformHandlers } from "./handlers/platform";
+import { eitherAuth } from "./middleware/eitherAuth";
+import { emit } from "@brain/emit";
+import "@skills";
+const app = Fastify({ logger: { level: "warn" }, bodyLimit: 12 * 1024 * 1024 });
+await app.register(cookie);
+await app.register(cors, {
+origin: (origin, cb) =>
+cb(null, !origin || origin.includes(process.env.APP_DOMAIN ?? "localhost:3000")),
+credentials: true,
+});
+app.get("/healthz", async () => ({ ok: true, service: "api", at: new Date().toISOString() }));
+await app.register(async (instance) => {
+instance.addHook("preHandler", eitherAuth(null));
+await controlHandlers(instance);
+await reviewHandlers(instance);
+await platformHandlers(instance);
+});
+await app.register(mountCatalogRoutes);
+await app.register(brainRoutes);
+await app.register(brainStreamRoutes);
+await app.register(auditorRoutes);
+await app.register(auditorGdprRoutes);
+await app.register(trustRoutes);
+await app.register(reviewRoutes);
+await app.register(ethicsEventsRoutes);
+app.addHook("onError", async (req, reply, err) => {
+emit({ type: "api.request.failed", source: req.url.startsWith("/mcp") ? "mcp" : "api",
+orgId: req.org?.id, severityOverride: "WARN",
+payload: { url: req.url, status: reply.statusCode,
+error: String(err.message).slice(0, 200) } });
+});
+const port = Number(process.env.PORT ?? 3000);
+await app.listen({ port, host: "0.0.0.0" });
+console.log(`API on :${port}`);
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+process.on(sig, async () => { await app.close(); process.exit(0); });
+}
+```
+### END FILE
+### FILE: apps/web/src/components/AppShell.tsx
+```tsx
+"use client";
+// OVERRIDE (batch 16) — adds Integrations, Risks, Framework, Matrix to nav.
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { ReactNode } from "react";
+const NAV = [
+{ href: "/", label: "Home", icon: "▣" },
+{ href: "/controls", label: "Controls", icon: "◇" },
+{ href: "/framework", label: "Framework", icon: "⊞" },
+{ href: "/integrations", label: "Integrations", icon: "⇄" },
+{ href: "/evidence", label: "Evidence", icon: "≣" },
+{ href: "/tests", label: "Tests", icon: "⚙" },
+{ href: "/tasks", label: "Tasks", icon: "✓", badge: 7 },
+{ href: "/risks", label: "Risks", icon: "⚠︎" },
+{ href: "/policies", label: "Policies", icon: "▤" },
+{ href: "/questionnaires", label: "Questionnaires", icon: "▦", badge: 32 },
+{ href: "/vendors", label: "Vendors", icon: "⌂" },
+{ href: "/privacy", label: "Privacy", icon: "⛨" },
+{ href: "/incidents", label: "Incidents", icon: "⚠" },
+{ href: "/radar", label: "Reg Radar", icon: "📡" },
+{ href: "/matrix", label: "Breach Matrix", icon: "🗺" },
+{ href: "/brain", label: "Brain", icon: "⬢" },
+];
+export function AppShell({ children }: { children: ReactNode }) {
+const path = usePathname();
+return (
+<div className="flex min-h-screen">
+<aside className="fixed inset-y-0 left-0 z-30 hidden w-[220px] flex-col border-r border-border bg-white md:flex">
+<div className="flex h-12 items-center gap-2 border-b border-border px-4 font-semibold">
+<span className="text-info">⬢</span> Compliance
+</div>
+<nav className="flex-1 space-y-0.5 overflow-y-auto p-2">
+{NAV.map((n) => {
+const active = n.href === "/" ? path === "/" : path.startsWith(n.href);
+return (
+<Link key={n.href} href={n.href}
+className={`flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px] ${active ? "bg-muted font-medium" : "text-zinc-600 hover:bg-muted/60"}`}>
+<span className="w-4 text-center text-muted-foreground">{n.icon}</span>
+<span className="flex-1">{n.label}</span>
+{n.badge !== undefined && <span className="rounded bg-zinc-900 px-1.5 text-[11px] font-medium text-white tabular-nums">{n.badge}</span>}
+</Link>
+);
+})}
+</nav>
+<div className="border-t border-border p-3 text-[11px] text-muted-foreground">⌘K to search</div>
+</aside>
+<main className="flex-1 md:pl-[220px]">
+<div className="flex h-12 items-center gap-3 border-b border-border px-6">
+<span className="text-xs text-muted-foreground">⌘K Search…</span>
+<div className="flex-1" />
+<span className="text-xs text-muted-foreground">Acme Corp</span>
+</div>
+<div className="p-6">{children}</div>
+</main>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/evidence/page.tsx
+```tsx
+import { EvidenceLibraryClient } from "../../components/EvidenceLibraryClient";
+export default function Page() { return <EvidenceLibraryClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/EvidenceLibraryClient.tsx
+```tsx
+"use client";
+import { useState } from "react";
+import { useApi } from "../lib/useApi";
+import { shortHash, relTime } from "../lib/format";
+import { Badge, Card, CardTitle, Skeleton } from "./ui";
+import { GradeBadge } from "./GradeBadge";
+interface Ev { id: string; sequence: number; title: string; controlSlug: string;
+controlName: string; sourceType: string; integrationType: string | null;
+collectedAt: string; expiresAt: string | null; contentHash: string; chainHash: string;
+quality: { score: number; grade: string } | null }
+export function EvidenceLibraryClient() {
+const { data, loading } = useApi<Ev[]>("/v1/evidence-library?limit=200");
+const [source, setSource] = useState<string>("ALL");
+const [grade, setGrade] = useState<string>("ALL");
+if (loading) return <Skeleton className="h-96" />;
+const rows = (data ?? []).filter((e) =>
+(source === "ALL" || e.sourceType === source) &&
+(grade === "ALL" || e.quality?.grade === grade));
+return (
+<div className="mx-auto max-w-5xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Evidence Library</h1>
+<span className="text-xs text-muted-foreground">{rows.length} rows · hash-chained per control</span>
+</div>
+<div className="flex gap-2">
+{["ALL", "AUTOMATED", "MANUAL"].map((s) => (
+<button key={s} onClick={() => setSource(s)}
+className={`rounded-md border px-2.5 py-1 text-xs ${source === s ? "border-zinc-900 bg-zinc-900 text-white" : "border-border"}`}>{s}</button>
+))}
+<div className="flex-1" />
+{["ALL", "A", "B", "C", "D", "F"].map((g) => (
+<button key={g} onClick={() => setGrade(g)}
+className={`rounded-md border px-2 py-1 text-xs ${grade === g ? "border-zinc-900 bg-zinc-900 text-white" : "border-border"}`}>{g}</button>
+))}
+</div>
+<Card>
+<CardTitle>Evidence</CardTitle>
+<div className="divide-y divide-border">
+{rows.length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No evidence matches. Connect an integration or run a check.</p>}
+{rows.map((e) => (
+<div key={e.id} className="flex items-center gap-3 px-4 py-3">
+{e.quality ? <GradeBadge grade={e.quality.grade} score={e.quality.score} /> : <span className="text-xs text-muted-foreground">—</span>}
+<div className="min-w-0 flex-1">
+<p className="truncate text-[13px] font-medium">{e.title}</p>
+<p className="text-xs text-muted-foreground">
+{e.controlName} · #{e.sequence} · {e.sourceType}{e.integrationType ? ` (${e.integrationType})` : ""} · {relTime(e.collectedAt)}
+{e.expiresAt && new Date(e.expiresAt) < new Date() && <span className="text-fail"> · expired</span>}
+</p>
+</div>
+<span className="mono hidden text-[10px] text-muted-foreground lg:inline">chain {shortHash(e.chainHash)}</span>
+<Badge tone={e.sourceType === "AUTOMATED" ? "info" : "zinc"}>{e.sourceType === "AUTOMATED" ? "auto" : "manual"}</Badge>
+</div>
+))}
+</div>
+</Card>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/tests/page.tsx
+```tsx
+import { TestsClient } from "../../components/TestsClient";
+export default function Page() { return <TestsClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/TestsClient.tsx
+```tsx
+"use client";
+import { useState } from "react";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { relTime } from "../lib/format";
+import { Badge, Button, Card, CardTitle, Skeleton } from "./ui";
+const STATE_TONE = { PASSING: "pass", FAILING: "fail", DEGRADED: "warn", STALE: "warn", UNTESTED: "zinc" } as const;
+interface Test { id: string; checkId: string; name: string; schedule: string; enabled: boolean;
+controlSlug: string; controlName: string; lastRunAt: string | null; state: string;
+recentRuns: { status: string; at: string }[] }
+export function TestsClient() {
+const { data, loading, refresh } = useApi<Test[]>("/v1/tests");
+const [running, setRunning] = useState<string | null>(null);
+const [flash, setFlash] = useState<string | null>(null);
+const run = async (t: Test) => {
+setRunning(t.checkId);
+try {
+const r = await api.runCheck(t.checkId);
+setFlash(`Run started for ${t.name} → ${r.status}. Watch the live feed.`);
+setTimeout(() => { setFlash(null); refresh(); }, 2500);
+} catch (e) { setFlash(`Failed: ${(e as Error).message}`); }
+finally { setRunning(null); }
+};
+if (loading) return <Skeleton className="h-96" />;
+return (
+<div className="mx-auto max-w-4xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Control Tests</h1>
+<span className="text-xs text-muted-foreground">{(data ?? []).filter((t) => t.enabled).length} enabled</span>
+</div>
+{flash && <div className="rounded-md border border-info/30 bg-info/5 px-3 py-2 text-xs text-info">{flash}</div>}
+<Card>
+<CardTitle>Automated checks (predicate DSL)</CardTitle>
+<div className="divide-y divide-border">
+{(data ?? []).map((t) => (
+<div key={t.id} className="flex items-center gap-3 px-4 py-3">
+<span className={`h-2 w-2 rounded-full ${t.enabled ? "bg-pass" : "bg-zinc-300"}`} />
+<div className="min-w-0 flex-1">
+<p className="truncate text-[13px] font-medium">{t.name}</p>
+<p className="text-xs text-muted-foreground">{t.controlName} · cron {t.schedule}{t.lastRunAt ? ` · last ${relTime(t.lastRunAt)}` : " · never run"}</p>
+</div>
+<div className="flex items-center gap-1">
+{t.recentRuns.slice(0, 5).map((r, i) => (
+<span key={i} title={`${r.status} ${relTime(r.at)}`}
+className={`h-2 w-2 rounded-full ${r.status === "PASS" ? "bg-pass" : r.status === "FAIL" ? "bg-fail" : "bg-warn"}`} />
+))}
+</div>
+<Badge tone={STATE_TONE[t.state as keyof typeof STATE_TONE] ?? "zinc"}>{t.state}</Badge>
+<Button variant="outline" onClick={() => run(t)} disabled={running === t.checkId || !t.enabled}>
+{running === t.checkId ? "…" : "Run now"}
+</Button>
+</div>
+))}
+</div>
+</Card>
+<p className="text-xs text-muted-foreground">Schedules are cron-jittered (hash offset 0–39 min) to flatten the 06:00–10:00 wall ~70%. Run <code className="rounded bg-muted px-1">pnpm --filter @workers schedules</code> after onboarding.</p>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/risks/page.tsx
+```tsx
+import { RiskRegisterClient } from "../../components/RiskRegisterClient";
+export default function Page() { return <RiskRegisterClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/RiskRegisterClient.tsx
+```tsx
+"use client";
+import { useApi } from "../lib/useApi";
+import { Badge, Card, CardTitle, Skeleton } from "./ui";
+interface Risk { id: string; title: string; category: string; inherent: number; residual: number;
+treatment: string; owner: string | null; nextReviewAt: string | null;
+linkedControls: { slug: string; name: string }[] }
+const TREAT_TONE = { MITIGATE: "info", ACCEPT: "warn", TRANSFER: "pass", AVOID: "zinc" } as const;
+function heat(score: number) {
+return score >= 16 ? "bg-fail/15 text-fail" : score >= 9 ? "bg-warn/15 text-warn"
+: score >= 4 ? "bg-info/10 text-info" : "bg-pass/10 text-pass";
+}
+export function RiskRegisterClient() {
+const { data, loading } = useApi<Risk[]>("/v1/risks");
+if (loading) return <Skeleton className="h-96" />;
+return (
+<div className="mx-auto max-w-5xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Risk Register</h1>
+<span className="text-xs text-muted-foreground">likelihood × impact · residual after treatment</span>
+</div>
+<Card>
+<CardTitle>Risks</CardTitle>
+<div className="divide-y divide-border">
+{(data ?? []).length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No risks recorded. Add from a gap analysis or manually.</p>}
+{(data ?? []).map((r) => (
+<div key={r.id} className="px-4 py-3">
+<div className="flex items-center gap-3">
+<span className={`inline-flex h-9 w-9 items-center justify-center rounded-md text-sm font-bold tabular-nums ${heat(r.residual)}`}>{r.residual}</span>
+<div className="min-w-0 flex-1">
+<p className="truncate text-[13px] font-medium">{r.title}</p>
+<p className="text-xs text-muted-foreground">{r.category} · inherent {r.inherent} → residual {r.residual}{r.owner ? ` · owner ${r.owner}` : ""}{r.nextReviewAt ? ` · review ${new Date(r.nextReviewAt).toLocaleDateString()}` : ""}</p>
+</div>
+<Badge tone={TREAT_TONE[r.treatment as keyof typeof TREAT_TONE] ?? "zinc"}>{r.treatment}</Badge>
+</div>
+{r.linkedControls.length > 0 && (
+<div className="mt-2 flex flex-wrap gap-1.5 pl-12">
+{r.linkedControls.map((c) => (
+<span key={c.slug} className="rounded border border-border bg-muted px-1.5 py-0.5 text-[11px] text-zinc-700">{c.name}</span>
+))}
+</div>
+)}
+</div>
+))}
+</div>
+</Card>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/integrations/page.tsx
+```tsx
+import { IntegrationsClient } from "../../components/IntegrationsClient";
+export default function Page() { return <IntegrationsClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/IntegrationsClient.tsx
+```tsx
+"use client";
+import { useApi } from "../lib/useApi";
+import { relTime } from "../lib/format";
+import { Badge, Card, CardTitle, Skeleton } from "./ui";
+interface IntegrationsData {
+connected: { id: string; type: string; status: string; lastSyncAt: string | null; syncError: string | null }[];
+catalog: { type: string; specs: { dataType: string; title: string; freshnessDays: number; controls: string[]; expectStable: boolean }[] }[];
+processing: string[];
+}
+const STATUS_TONE = { CONNECTED: "pass", SYNCING: "info", ERROR: "fail", DISCONNECTED: "zinc" } as const;
+export function IntegrationsClient() {
+const { data, loading } = useApi<IntegrationsData>("/v1/integrations");
+if (loading) return <Skeleton className="h-96" />;
+if (!data) return null;
+return (
+<div className="mx-auto max-w-5xl space-y-4">
+<h1 className="text-lg font-semibold">Integrations</h1>
+<Card>
+<CardTitle>How evidence is processed</CardTitle>
+<div className="space-y-1.5 p-4">
+{data.processing.map((p, i) => (
+<p key={i} className="text-[13px] text-muted-foreground"><span className="mono mr-2 text-zinc-400">{i + 1}</span>{p.slice(3)}</p>
+))}
+</div>
+</Card>
+<Card>
+<CardTitle right={<Badge tone="zinc">{data.connected.length}</Badge>}>Connected</CardTitle>
+<div className="divide-y divide-border">
+{data.connected.length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No integrations connected. Add credentials via <code className="rounded bg-muted px-1">storeCredentials</code> or the onboarding flow.</p>}
+{data.connected.map((c) => (
+<div key={c.id} className="flex items-center gap-3 px-4 py-3">
+<span className={`h-2 w-2 rounded-full ${c.status === "CONNECTED" ? "bg-pass" : c.status === "ERROR" ? "bg-fail" : "bg-warn"}`} />
+<div className="min-w-0 flex-1">
+<p className="text-[13px] font-medium">{c.type}</p>
+<p className="text-xs text-muted-foreground">{c.lastSyncAt ? `last sync ${relTime(c.lastSyncAt)}` : "never synced"}{c.syncError ? ` · ${c.syncError}` : ""}</p>
+</div>
+<Badge tone={STATUS_TONE[c.status as keyof typeof STATUS_TONE] ?? "zinc"}>{c.status}</Badge>
+</div>
+))}
+</div>
+</Card>
+<Card>
+<CardTitle>Connector catalog — what each collects & which controls it feeds</CardTitle>
+<div className="divide-y divide-border">
+{data.catalog.map((c) => (
+<div key={c.type} className="px-4 py-3">
+<p className="mb-2 text-[13px] font-semibold">{c.type}</p>
+<div className="space-y-2">
+{c.specs.map((s) => (
+<div key={s.dataType} className="rounded-md border border-border bg-white p-2.5">
+<div className="flex items-center gap-2">
+<span className="mono text-xs text-info">{s.dataType}</span>
+<Badge tone="zinc">{s.freshnessDays}d freshness</Badge>
+{s.expectStable && <Badge tone="warn">drift-monitored</Badge>}
+</div>
+<p className="mt-1 text-xs text-muted-foreground">{s.title}</p>
+<p className="mt-1 text-[11px] text-muted-foreground">feeds: {s.controls.join(", ") || "—"}</p>
+</div>
+))}
+</div>
+</div>
+))}
+{data.catalog.length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No connectors registered.</p>}
+</div>
+</Card>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/radar/page.tsx
+```tsx
+import { RadarClient } from "../../components/RadarClient";
+export default function Page() { return <RadarClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/RadarClient.tsx
+```tsx
+"use client";
+import { useState } from "react";
+import { useApi } from "../lib/useApi";
+import { relTime } from "../lib/format";
+import { Badge, Card, CardTitle, Skeleton, Tabs } from "./ui";
+const IMPACT_TONE = { CRITICAL: "fail", MAJOR: "warn", MINOR: "info", INFO: "zinc" } as const;
+const STATUS_TONE = { PENDING_REVIEW: "warn", VERIFIED: "info", REJECTED: "fail", APPLIED: "pass" } as const;
+interface Change { id: string; changeType: string; jurisdiction: string; summary: string;
+effectiveAt: string | null; status: string; source: { title: string; url: string; docType: string };
+impacts: { framework: string; requirement: string | null; requirementTitle: string | null;
+impactLevel: string; rationale: string; suggestedAction: string | null }[] }
+interface Sources { federal: { name: string; authority: string; jurisdiction: string; parser: string; enabled: boolean; lastCheckedAt: string | null }[];
+state: { stateCode: string; strategy: string; sessionCycle: string; watchSections: string[]; enabled: boolean; lastPolledAt: string | null }[] }
+interface Proposal { id: string; status: string; state: string; rule: string; bill: string; billTitle: string;
+changes: { field: string; from: unknown; to: unknown }[]; effectiveAt: string | null; confidence: number; createdAt: string }
+type Tab = "changes" | "sources" | "proposals";
+export function RadarClient() {
+const changes = useApi<Change[]>("/v1/radar/changes?limit=50");
+const sources = useApi<Sources>("/v1/radar/sources");
+const proposals = useApi<Proposal[]>("/v1/radar/proposals");
+const [tab, setTab] = useState<Tab>("changes");
+const [expanded, setExpanded] = useState<string | null>(null);
+if (changes.loading || sources.loading || proposals.loading) return <Skeleton className="h-96" />;
+return (
+<div className="mx-auto max-w-5xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Regulatory Change Radar</h1>
+<span className="text-xs text-muted-foreground">expert review gates application</span>
+</div>
+<Card>
+<Tabs<Tab> active={tab} onChange={setTab} tabs={[
+{ id: "changes", label: "Changes", count: changes.data?.length ?? 0 },
+{ id: "sources", label: "Sources", count: (sources.data?.federal.length ?? 0) + (sources.data?.state.length ?? 0) },
+{ id: "proposals", label: "Matrix Proposals", count: proposals.data?.length ?? 0 },
+]} />
+{tab === "changes" && (
+<div className="divide-y divide-border">
+{(changes.data ?? []).length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No regulatory changes detected yet.</p>}
+{(changes.data ?? []).map((c) => (
+<div key={c.id} className="px-4 py-3">
+<button onClick={() => setExpanded(expanded === c.id ? null : c.id)} className="flex w-full items-start gap-3 text-left">
+<div className="min-w-0 flex-1">
+<p className="text-[13px] font-medium leading-relaxed">{c.summary}</p>
+<p className="mt-0.5 text-xs text-muted-foreground">{c.jurisdiction} · {c.changeType} · {c.source.docType}{c.effectiveAt ? ` · eff ${new Date(c.effectiveAt).toLocaleDateString()}` : ""} · via {c.source.title}</p>
+</div>
+<Badge tone={STATUS_TONE[c.status as keyof typeof STATUS_TONE] ?? "zinc"}>{c.status}</Badge>
+<span className="text-muted-foreground">{expanded === c.id ? "▾" : "▸"}</span>
+</button>
+{expanded === c.id && c.impacts.length > 0 && (
+<div className="mt-3 space-y-2 border-t border-border pt-3">
+{c.impacts.map((im, i) => (
+<div key={i} className="rounded-md border border-border bg-white p-2.5">
+<div className="flex items-center gap-2">
+<Badge tone={IMPACT_TONE[im.impactLevel as keyof typeof IMPACT_TONE] ?? "zinc"}>{im.impactLevel}</Badge>
+<span className="text-xs font-medium">{im.framework} {im.requirement ?? ""}</span>
+<span className="text-xs text-muted-foreground">{im.requirementTitle}</span>
+</div>
+<p className="mt-1 text-xs text-muted-foreground">{im.rationale}</p>
+{im.suggestedAction && <p className="mt-1 text-xs text-info">→ {im.suggestedAction}</p>}
+</div>
+))}
+</div>
+)}
+</div>
+))}
+</div>
+)}
+{tab === "sources" && sources.data && (
+<div className="p-4">
+<p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Federal / agency feeds</p>
+<div className="mb-4 space-y-1.5">
+{sources.data.federal.map((s) => (
+<div key={s.name} className="flex items-center gap-2 text-[13px]">
+<span className={`h-2 w-2 rounded-full ${s.enabled ? "bg-pass" : "bg-zinc-300"}`} />
+<span className="flex-1">{s.name}</span>
+<span className="text-xs text-muted-foreground">{s.parser}{s.lastCheckedAt ? ` · checked ${relTime(s.lastCheckedAt)}` : ""}</span>
+</div>
+))}
+</div>
+<p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">State legislature feeds (LegiScan) — derived from the breach matrix</p>
+<div className="grid gap-1.5 sm:grid-cols-2">
+{sources.data.state.map((s) => (
+<div key={s.stateCode} className="flex items-center gap-2 rounded border border-border px-2 py-1.5 text-xs">
+<span className={`h-1.5 w-1.5 rounded-full ${s.enabled ? "bg-pass" : "bg-zinc-300"}`} />
+<span className="mono font-medium">{s.stateCode}</span>
+<span className="text-muted-foreground">{s.sessionCycle}</span>
+<span className="ml-auto text-muted-foreground">{s.watchSections.length} watched §</span>
+</div>
+))}
+</div>
+</div>
+)}
+{tab === "proposals" && (
+<div className="divide-y divide-border">
+{(proposals.data ?? []).length === 0 && <p className="p-8 text-center text-xs text-muted-foreground">No pending matrix amendments. Enacted bills or manual corrections land here for expert review.</p>}
+{(proposals.data ?? []).map((p) => (
+<div key={p.id} className="px-4 py-3">
+<div className="flex items-center gap-3">
+<div className="min-w-0 flex-1">
+<p className="text-[13px] font-medium">{p.state} — {p.rule}</p>
+<p className="text-xs text-muted-foreground">{p.bill}: {p.billTitle} · conf {p.confidence.toFixed(2)}{p.effectiveAt ? ` · eff ${new Date(p.effectiveAt).toLocaleDateString()}` : ""}</p>
+</div>
+<Badge tone={STATUS_TONE[p.status as keyof typeof STATUS_TONE] ?? "warn"}>{p.status}</Badge>
+</div>
+<div className="mt-2 space-y-1">
+{p.changes.map((ch, i) => (
+<p key={i} className="mono text-xs text-muted-foreground">{ch.field}: <span className="text-zinc-400 line-through">{String(ch.from)}</span> → <span className="text-zinc-800">{String(ch.to)}</span></p>
+))}
+</div>
+</div>
+))}
+</div>
+)}
+</Card>
+<p className="text-xs text-muted-foreground">Approving a MATRIX_PROPOSAL bumps the rule version, flips it to EXPERT_VERIFIED, and recomputes deadlines on any open incident in that jurisdiction. Nothing is customer-visible until verified.</p>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/matrix/page.tsx
+```tsx
+import { MatrixClient } from "../../components/MatrixClient";
+export default function Page() { return <MatrixClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/MatrixClient.tsx
+```tsx
+"use client";
+import { useState } from "react";
+import { api } from "../lib/api";
+import { useApi } from "../lib/useApi";
+import { Badge, Button, Card, CardTitle, Modal, Skeleton } from "./ui";
+interface Rule { code: string; name: string; citation: string; deadlineDays: number | null;
+notifyResidents: boolean; agThreshold: unknown; creditAgencyThreshold: unknown;
+otherAgencies: string[]; harmGate: boolean; encryptionSafeHarbor: boolean;
+verificationStatus: string; compiledConfidence: number; version: number; lastVerifiedAt: string | null }
+const EDITABLE = ["deadlineDays", "notifyResidents", "harmGate", "encryptionSafeHarbor"] as const;
+export function MatrixClient() {
+const { data, loading, refresh } = useApi<Rule[]>("/v1/breach-matrix");
+const [filter, setFilter] = useState<string>("ALL");
+const [proposeFor, setProposeFor] = useState<Rule | null>(null);
+const [field, setField] = useState<string>("deadlineDays");
+const [value, setValue] = useState<string>("");
+const [note, setNote] = useState<string>("");
+const [busy, setBusy] = useState(false);
+const [flash, setFlash] = useState<string | null>(null);
+if (loading) return <Skeleton className="h-96" />;
+const rows = (data ?? []).filter((r) => filter === "ALL" || r.verificationStatus === filter);
+const submit = async () => {
+if (!proposeFor || !value) return;
+setBusy(true);
+try {
+const to = field === "deadlineDays" ? Number(value)
+: field === "notifyResidents" || field === "harmGate" || field === "encryptionSafeHarbor"
+? value === "true" : value;
+const r = await api.post<{ note: string }>(`/v1/breach-matrix/${proposeFor.code}/propose`,
+{ changes: [{ field, to }], note });
+setProposeFor(null); setValue(""); setNote("");
+setFlash(r.note); refresh();
+} catch (e) { setFlash(`Failed: ${(e as Error).message}`); }
+finally { setBusy(false); }
+};
+return (
+<div className="mx-auto max-w-6xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">50-State Breach Notification Matrix</h1>
+<span className="text-xs text-muted-foreground">{rows.length} jurisdictions</span>
+</div>
+{flash && <div className="rounded-md border border-info/30 bg-info/5 px-3 py-2 text-xs text-info">{flash}</div>}
+<div className="flex gap-2">
+{["ALL", "AI_COMPILED", "EXPERT_VERIFIED"].map((s) => (
+<button key={s} onClick={() => setFilter(s)}
+className={`rounded-md border px-2.5 py-1 text-xs ${filter === s ? "border-zinc-900 bg-zinc-900 text-white" : "border-border"}`}>{s}</button>
+))}
+</div>
+<Card>
+<CardTitle right={<Badge tone="draft">AI_COMPILED until expert-verified</Badge>}>Jurisdiction rules</CardTitle>
+<div className="overflow-x-auto">
+<table className="w-full text-[13px]">
+<thead>
+<tr className="border-b border-border text-left text-[11px] uppercase tracking-wide text-muted-foreground">
+<th className="px-4 py-2">State</th><th className="px-2 py-2">Citation</th>
+<th className="px-2 py-2">Deadline</th><th className="px-2 py-2">Notify</th>
+<th className="px-2 py-2">AG threshold</th><th className="px-2 py-2">Flags</th>
+<th className="px-2 py-2">Status</th><th className="px-2 py-2">v</th><th className="px-2 py-2"></th>
+</tr>
+</thead>
+<tbody className="divide-y divide-border">
+{rows.map((r) => (
+<tr key={r.code} className="hover:bg-muted/40">
+<td className="px-4 py-2 font-medium">{r.code}<div className="text-xs font-normal text-muted-foreground">{r.name}</div></td>
+<td className="mono px-2 py-2 text-xs text-muted-foreground">{r.citation}</td>
+<td className="px-2 py-2 tabular-nums">{r.deadlineDays !== null ? `${r.deadlineDays}d` : <span className="text-muted-foreground">policy 45d</span>}</td>
+<td className="px-2 py-2">{r.notifyResidents ? "residents" : <span className="text-muted-foreground">AG only</span>}</td>
+<td className="px-2 py-2 text-xs">{String(r.agThreshold ?? "—")}</td>
+<td className="px-2 py-2 text-xs text-muted-foreground">
+{[r.harmGate && "harm-gate", r.encryptionSafeHarbor && "enc-safe-harbor", r.otherAgencies.length > 0 && `+${r.otherAgencies.length} ag`].filter(Boolean).join(" · ") || "—"}
+</td>
+<td className="px-2 py-2"><Badge tone={r.verificationStatus === "EXPERT_VERIFIED" ? "pass" : "draft"}>{r.verificationStatus === "EXPERT_VERIFIED" ? "verified" : "AI"}</Badge></td>
+<td className="px-2 py-2 tabular-nums text-muted-foreground">{r.version}</td>
+<td className="px-2 py-2"><Button variant="outline" onClick={() => { setProposeFor(r); setField("deadlineDays"); setValue(""); setNote(""); }}>Propose amendment</Button></td>
+</tr>
+))}
+</tbody>
+</table>
+</div>
+</Card>
+<Modal open={!!proposeFor} onClose={() => setProposeFor(null)} title={`Propose amendment — ${proposeFor?.code}`}>
+{proposeFor && (
+<div className="space-y-3">
+<p className="text-xs text-muted-foreground">This creates a <strong>MatrixAmendmentProposal</strong> in the review queue. The rule updates only after an expert with <code className="rounded bg-muted px-1">LEGAL_US_STATES</code> credential approves it. Current: deadline {proposeFor.deadlineDays ?? "policy"}, v{proposeFor.version}.</p>
+<label className="block text-xs font-medium">Field
+<select value={field} onChange={(e) => setField(e.target.value)} className="mt-1 w-full rounded-md border border-border p-2 text-[13px]">
+{EDITABLE.map((f) => <option key={f} value={f}>{f}</option>)}
+</select></label>
+<label className="block text-xs font-medium">New value
+<input value={value} onChange={(e) => setValue(e.target.value)} placeholder={field === "deadlineDays" ? "e.g. 21" : "true / false"} className="mt-1 w-full rounded-md border border-border p-2 text-[13px]" /></label>
+<label className="block text-xs font-medium">Reviewer note (statutory justification)
+<textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2} className="mt-1 w-full rounded-md border border-border p-2 text-[13px]" /></label>
+<div className="flex justify-end gap-2">
+<Button variant="ghost" onClick={() => setProposeFor(null)}>Cancel</Button>
+<Button onClick={submit} disabled={busy || !value}>{busy ? "Submitting…" : "Submit for review"}</Button>
+</div>
+</div>
+)}
+</Modal>
+</div>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/app/framework/page.tsx
+```tsx
+import { FrameworkClient } from "../../components/FrameworkClient";
+export default function Page() { return <FrameworkClient />; }
+```
+### END FILE
+### FILE: apps/web/src/components/FrameworkClient.tsx
+```tsx
+"use client";
+import { useMemo, useState } from "react";
+import { useApi } from "../lib/useApi";
+import { Badge, Card, CardTitle, Skeleton, Tabs } from "./ui";
+interface Req { id: string; framework: string; frameworkName: string; frameworkPublished: boolean;
+code: string; title: string; category: string; kind: string; satisfiedByWorkflow: string | null;
+verified: boolean; verifiedBy: string | null; controlMappingCount: number }
+interface Template { id: string; name: string; category: string; description: string; satisfiedBy: string;
+checkIds: string[]; policyTypes: string[]; mappings: { framework: string; code: string; confidence: number }[] }
+type Tab = "requirements" | "templates";
+const KIND_TONE = { CONTROL: "info", WORKFLOW: "pass" } as const;
+export function FrameworkClient() {
+const reqs = useApi<Req[]>("/v1/framework/requirements");
+const templates = useApi<Template[]>("/v1/framework/templates");
+const [tab, setTab] = useState<Tab>("requirements");
+const [fw, setFw] = useState<string>("ALL");
+const [q, setQ] = useState("");
+const grouped = useMemo(() => {
+const list = (reqs.data ?? []).filter((r) =>
+(fw === "ALL" || r.framework === fw) &&
+(!q || r.code.toLowerCase().includes(q.toLowerCase()) || r.title.toLowerCase().includes(q.toLowerCase())));
+const byFw = new Map<string, Req[]>();
+for (const r of list) { if (!byFw.has(r.framework)) byFw.set(r.framework, []); byFw.get(r.framework)!.push(r); }
+return byFw;
+}, [reqs.data, fw, q]);
+if (reqs.loading || templates.loading) return <Skeleton className="h-96" />;
+return (
+<div className="mx-auto max-w-5xl space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold">Unified Control Framework</h1>
+<span className="text-xs text-muted-foreground">one control → four frameworks</span>
+</div>
+<Card>
+<Tabs<Tab> active={tab} onChange={setTab} tabs={[
+{ id: "requirements", label: "Requirements", count: reqs.data?.length ?? 0 },
+{ id: "templates", label: "Control Templates", count: templates.data?.length ?? 0 },
+]} />
+{tab === "requirements" && (
+<div className="p-4">
+<div className="mb-3 flex flex-wrap items-center gap-2">
+{["ALL", "SOC2", "ISO27001", "HIPAA", "GDPR"].map((f) => (
+<button key={f} onClick={() => setFw(f)}
+className={`rounded-md border px-2.5 py-1 text-xs ${fw === f ? "border-zinc-900 bg-zinc-900 text-white" : "border-border"}`}>{f}</button>
+))}
+<input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter by code or title…"
+className="ml-auto w-56 rounded-md border border-border p-1.5 text-xs" />
+</div>
+{[...grouped.entries()].map(([framework, list]) => (
+<div key={framework} className="mb-5">
+<div className="mb-2 flex items-center gap-2">
+<h3 className="text-[13px] font-semibold">{list[0].frameworkName}</h3>
+<Badge tone={list[0].frameworkPublished ? "pass" : "draft"}>{list[0].frameworkPublished ? "published" : "gated — needs full verification"}</Badge>
+<span className="text-xs text-muted-foreground">{list.length} requirements</span>
+</div>
+<div className="space-y-1.5">
+{list.map((r) => (
+<div key={r.id} className="flex items-center gap-3 rounded-md border border-border px-3 py-2">
+<Badge tone={KIND_TONE[r.kind as keyof typeof KIND_TONE] ?? "zinc"}>{r.kind}</Badge>
+<span className="mono w-32 shrink-0 text-xs font-medium">{r.code}</span>
+<div className="min-w-0 flex-1">
+<p className="truncate text-[13px]">{r.title}</p>
+<p className="truncate text-xs text-muted-foreground">{r.category}{r.satisfiedByWorkflow ? ` → workflow:${r.satisfiedByWorkflow}` : ""}</p>
+</div>
+<span className="text-xs text-muted-foreground tabular-nums">{r.controlMappingCount} ctrl</span>
+<Badge tone={r.verified ? "pass" : "draft"}>{r.verified ? "verified" : "unverified"}</Badge>
+</div>
+))}
+</div>
+</div>
+))}
+</div>
+)}
+{tab === "templates" && (
+<div className="divide-y divide-border">
+{(templates.data ?? []).map((t) => (
+<div key={t.id} className="px-4 py-3">
+<div className="flex items-center gap-2">
+<p className="flex-1 text-[13px] font-medium">{t.name}</p>
+<Badge tone={t.satisfiedBy === "WORKFLOW" ? "pass" : "info"}>{t.satisfiedBy}</Badge>
+</div>
+<p className="mt-0.5 text-xs text-muted-foreground">{t.description}</p>
+<div className="mt-2 flex flex-wrap gap-1.5">
+{t.mappings.map((m, i) => (
+<span key={i} className="rounded border border-border bg-muted px-1.5 py-0.5 text-[11px] text-zinc-700">
+{m.framework} {m.code} <span className="text-muted-foreground">({m.confidence})</span>
+</span>
+))}
+</div>
+{(t.checkIds.length > 0 || t.policyTypes.length > 0) && (
+<p className="mt-1.5 text-[11px] text-muted-foreground">
+{t.checkIds.length > 0 && <>checks: {t.checkIds.join(", ")}</>}
+{t.checkIds.length > 0 && t.policyTypes.length > 0 && " · "}
+{t.policyTypes.length > 0 && <>policies: {t.policyTypes.join(", ")}</>}
+</p>
+)}
+</div>
+))}
+</div>
+)}
+</Card>
+<p className="text-xs text-muted-foreground">Onboarding instantiates templates into org controls. When an org adds a framework, <code className="rounded bg-muted px-1">suggestMappingsForNewFramework</code> proposes new control mappings for expert acceptance. GDPR <span className="mono">WORKFLOW</span> requirements route to the privacy module instead of controls.</p>
+</div>
+);
+}
+```
+### END FILE
+````
+
+## Run it
+```bash
+python3 split.py batch16.txt
+pnpm dev            # restart the API to load platformHandlers
+```
+New screens: `/evidence`, `/tests`, `/risks`, `/integrations`, `/radar`, `/matrix`, `/framework`.
+
+## The end-to-end regulatory-change loop you now have in the UI
+
+1. **`/radar` → Sources** shows the Federal Register feeds + every state legislature feed (auto-derived from the matrix).
+2. **`/radar` → Changes** shows each detected `RegChange` with AI-graded `ChangeImpact`s (which framework/requirement, impact level, suggested action) and its review status.
+3. **`/radar` → Matrix Proposals** + **`/matrix` → Propose amendment** let you modify rules — both create a `MatrixAmendmentProposal` that goes to the expert review queue; **nothing edits the rule row directly**.
+4. **`/framework`** shows requirements (verified/unverified, CONTROL vs WORKFLOW) and control templates, so you can see exactly which requirements a reg change touches and how controls map across all four frameworks.
+
+**Still genuinely open** (by design, not gaps): the expert *approval* action in-app currently lives in the review console routes (`POST /v1/review/:id/decide`) — the screens above surface the proposals, and approval is enforced server-side with credential + four-eyes checks. Want me to add an in-app **Review Console screen** (claim → render bundle → approve/reject with credential gating) so the whole loop closes in the UI?

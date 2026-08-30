@@ -1,0 +1,75 @@
+### FILE: docker/Dockerfile.railway
+```dockerfile
+# One image, any service — Railway sets SERVICE per service at runtime.
+FROM node:22-slim
+RUN corepack enable && corepack prepare pnpm@9.0.0 --activate
+WORKDIR /app
+COPY . .
+RUN pnpm install --no-frozen-lockfile
+# Generate all three Prisma clients
+RUN pnpm --filter @db exec prisma generate --schema prisma/schema.prisma
+RUN pnpm --filter @brain exec prisma generate --schema prisma/schema.prisma
+RUN pnpm --filter @ethics exec prisma generate --schema prisma/schema.prisma
+# Pre-build web so `next start` works
+RUN cd apps/web && npx next build
+ENV NODE_ENV=production
+CMD ["sh", "-c", "case \"$SERVICE\" in \
+  apps/web)      cd apps/web && exec npx next start -p ${PORT:-3000} ;; \
+  packages/brain) exec npx tsx packages/brain/src/worker.ts ;; \
+  packages/mcp)  exec npx tsx packages/mcp/src/server.ts ;; \
+  *)             exec npx tsx $SERVICE/src/index.ts ;; \
+esac"]
+```
+### END FILE
+### FILE: docs/RAILWAY.md
+```markdown
+# Railway deployment
+
+Railway has no Temporal or KMS plugin, so this layout uses:
+- Railway **PostgreSQL** (pgvector image) + **Redis** plugins
+- **Temporal Cloud** (or self-hosted Temporal elsewhere) for workers
+- **AWS** for KMS + S3 (the app's envelope encryption assumes KMS)
+
+## Services (all from the same repo, Dockerfile = docker/Dockerfile.railway)
+| Service | SERVICE env | Port | Notes |
+|---|---|---|---|
+| api | apps/api | 3000 | public |
+| web | apps/web | 3000 | set NEXT_PUBLIC_API_URL=https://<api> |
+| workers | apps/workers | — | no port; needs TEMPORAL_ADDRESS |
+| brain | packages/brain | 3010 | public status |
+| mcp | packages/mcp | 3001 | public |
+| ethics | apps/ethics | 3002 | isolated; own DB |
+
+## Steps
+1. New Railway project → add **PostgreSQL** plugin (use image
+   `pgvector/pgvector:pg16` in plugin settings) and **Redis** plugin.
+2. Add a second PostgreSQL plugin for ethics (or a separate database).
+3. For each service above: New → GitHub repo → set **Dockerfile path**
+   `docker/Dockerfile.railway`, set root `/`, and set the `SERVICE` env.
+4. Shared env (all services):
+   DATABASE_URL (from plugin, add `?schema=public`), REDIS_URL (plugin),
+   TEMPORAL_ADDRESS + TEMPORAL_API_KEY (Temporal Cloud),
+   ANTHROPIC_API_KEY or OPENAI_API_KEY, SESSION_SECRET,
+   AWS_REGION, AWS_KMS_MAIN_KEY_ID, AWS_KMS_ETHICS_KEY_ID, S3_EVIDENCE_BUCKET,
+   ETHICS_DATABASE_URL, ETHICS_EVENT_HMAC_SECRET, ETHICS_INVESTIGATOR_TOKEN.
+5. One-off schema+seed (use `railway run` from CLI inside the api service):
+   npx prisma db push --schema packages/db/prisma/schema.prisma
+   npx prisma db push --schema packages/brain/prisma/schema.prisma
+   npx prisma db push --schema apps/ethics/prisma/schema.prisma
+   psql "$DATABASE_URL" -f packages/db/prisma/rls.sql
+   psql "$DATABASE_URL" -f packages/db/prisma/vector.sql
+   npx tsx packages/db/seed/load-seed.ts
+   npx tsx packages/core/src/controls/loadTemplates.ts
+   npx tsx packages/core/src/incidents/loadMatrix.ts
+   npx tsx packages/knowledge/src/sources/seed.ts
+   npx tsx packages/knowledge/src/legislative/sourcePack.ts
+   npx tsx packages/db/seed/prompts.ts
+6. After onboarding an org, run schedules once:
+   npx tsx apps/workers/src/schedules.ts
+7. Health-check: GET /healthz (api), /status.json (brain), /healthz (ethics).
+
+⚠️ Launch gate unchanged: all legal content is AI_COMPILED until experts
+verify it in the review console. Do not expose statutory deadlines to
+customers before that.
+```
+### END FILE

@@ -1,0 +1,430 @@
+### FILE: apps/web/tailwind.config.ts
+```typescript
+import type { Config } from "tailwindcss";
+export default {
+darkMode: "class",
+content: ["./src/**/*.{ts,tsx}"],
+theme: {
+extend: {
+colors: {
+background: "hsl(var(--background) / <alpha-value>)",
+surface: "hsl(var(--surface) / <alpha-value>)",
+raised: "hsl(var(--raised) / <alpha-value>)",
+muted: "hsl(var(--muted) / <alpha-value>)",
+"muted-foreground": "hsl(var(--muted-fg) / <alpha-value>)",
+border: "hsl(var(--border) / <alpha-value>)",
+"border-strong": "hsl(var(--border-strong) / <alpha-value>)",
+accent: "hsl(var(--accent) / <alpha-value>)",
+pass: "#10b981", fail: "#f43f5e", warn: "#f59e0b",
+info: "#3b82f6", draft: "#b45309",
+},
+boxShadow: {
+xs: "0 1px 2px 0 rgb(16 24 40 / 0.05)",
+card: "0 1px 2px 0 rgb(16 24 40 / 0.05), 0 1px 3px 0 rgb(16 24 40 / 0.04)",
+pop: "0 12px 32px -8px rgb(0 0 0 / 0.16), 0 4px 12px -4px rgb(0 0 0 / 0.08)",
+},
+fontFamily: { sans: ["Inter", "ui-sans-serif", "system-ui", "-apple-system", "Segoe UI", "sans-serif"] },
+},
+},
+} satisfies Config;
+```
+### END FILE
+### FILE: apps/web/src/styles/globals.css
+```css
+@tailwind base; @tailwind components; @tailwind utilities;
+:root {
+--background: 0 0% 100%; --surface: 240 6% 97.5%; --raised: 0 0% 100%;
+--muted: 240 5% 95.5%; --muted-fg: 240 4% 45%;
+--border: 240 6% 89.5%; --border-strong: 240 5% 78%; --accent: 243 75% 59%;
+}
+.dark {
+--background: 240 10% 4.5%; --surface: 240 7% 7%; --raised: 240 6% 8.5%;
+--muted: 240 6% 13%; --muted-fg: 240 5% 64%;
+--border: 240 6% 16%; --border-strong: 240 5% 28%; --accent: 247 90% 75%;
+}
+@layer base {
+html { -webkit-font-smoothing: antialiased; }
+body { @apply bg-background text-zinc-900 dark:text-zinc-50; font-size: 13px; }
+::selection { background: hsl(var(--accent) / 0.18); }
+}
+```
+### END FILE
+### FILE: apps/web/src/app/layout.tsx
+```tsx
+import type { Metadata } from "next";
+import "../styles/globals.css";
+import { AppShell } from "../components/AppShell";
+export const metadata: Metadata = {
+title: "Compliance — AI-first ethics & compliance platform",
+description: "Unified controls, tamper-evident evidence, and automated compliance operations.",
+};
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+return (
+<html lang="en" suppressHydrationWarning>
+<head>
+<script dangerouslySetInnerHTML={{ __html: `try{if(localStorage.theme==="dark"||(!("theme" in localStorage)&&matchMedia("(prefers-color-scheme: dark)").matches))document.documentElement.classList.add("dark")}catch(e){}` }} />
+</head>
+<body><AppShell>{children}</AppShell></body>
+</html>
+);
+}
+```
+### END FILE
+### FILE: apps/web/src/components/ui.tsx
+```tsx
+"use client";
+// SUPERSET ui — v1 names (Button/Card/CardTitle/Badge/Tabs/Modal/Skeleton/Kbd)
+// AND v2 names (Icon/IconButton/ToastProvider/Ring/Stat/…) so every screen
+// emitted across all batches resolves against one file. Fixes the blank page.
+import { ReactNode, ButtonHTMLAttributes, HTMLAttributes, InputHTMLAttributes,
+SelectHTMLAttributes, TextareaHTMLAttributes, createContext, useCallback,
+useContext, useEffect, useId, useState } from "react";
+/* ── icons ── */
+const PATHS: Record<string, ReactNode> = {
+home: <><path d="M3 10.5 12 3l9 7.5" /><path d="M5 9.5V21h14V9.5" /></>,
+controls: <><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></>,
+evidence: <><path d="m12 3 8 4-8 4-8-4 8-4z" /><path d="m4 11.5 8 4 8-4" /><path d="m4 15.5 8 4 8-4" /></>,
+tests: <><path d="M9 3h6" /><path d="M10 3v6L4.6 19a2 2 0 0 0 1.8 3h11.2a2 2 0 0 0 1.8-3L14 9V3" /></>,
+tasks: <><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m8 12 3 3 5-6" /></>,
+policies: <><path d="M6 2h9l5 5v15H6z" /><path d="M14 2v6h6" /><path d="M9 13h6M9 17h4" /></>,
+questionnaire: <><rect x="4" y="3" width="16" height="18" rx="2" /><path d="M8 8h8M8 12h8M8 16h5" /></>,
+vendors: <><path d="m3 9 1.5-5h15L21 9" /><path d="M4 9v11h16V9" /><path d="M9 20v-6h6v6" /></>,
+privacy: <><rect x="5" y="10" width="14" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>,
+incidents: <><path d="M12 3 2.5 20h19L12 3z" /><path d="M12 10v4" /><path d="M12 17.5v.5" /></>,
+radar: <><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="4.5" /><path d="m12 12 6-6" /></>,
+brain: <path d="M4 12h4l2-6 3 12 2-6h5" />,
+trust: <path d="m12 3 7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z" />,
+onboard: <path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z" />,
+search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
+sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></>,
+moon: <path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z" />,
+bell: <><path d="M6 9a6 6 0 0 1 12 0c0 5 2 6 2 6H4s2-1 2-6" /><path d="M10 20a2 2 0 0 0 4 0" /></>,
+x: <path d="m6 6 12 12M18 6 6 18" />,
+};
+export function Icon({ name, className = "h-4 w-4" }: { name: string; className?: string }) {
+return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden>{PATHS[name]}</svg>;
+}
+/* ── buttons ── */
+const V = {
+default: "bg-zinc-900 text-white hover:bg-zinc-700 dark:bg-white dark:text-zinc-900",
+primary: "bg-zinc-900 text-white hover:bg-zinc-700 dark:bg-white dark:text-zinc-900",
+outline: "border border-border bg-raised hover:bg-muted dark:hover:bg-muted",
+ghost: "hover:bg-muted",
+danger: "bg-fail/10 text-fail border border-fail/30 hover:bg-fail/20",
+success: "bg-pass/10 text-pass border border-pass/30 hover:bg-pass/20",
+};
+export function Button({ variant = "default", className = "", ...p }:
+ButtonHTMLAttributes<HTMLButtonElement> & { variant?: keyof typeof V }) {
+return <button {...p} className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-[13px] font-medium transition disabled:opacity-40 disabled:pointer-events-none active:scale-[0.98] ${V[variant]} ${className}`} />;
+}
+export function IconButton({ label, className = "", ...p }:
+ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
+return <button {...p} aria-label={label} title={label}
+className={`inline-flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition hover:bg-muted hover:text-zinc-900 dark:hover:text-zinc-100 ${className}`} />;
+}
+/* ── surfaces ── */
+export function Card({ className = "", ...p }: HTMLAttributes<HTMLDivElement>) {
+return <div {...p} className={`rounded-lg border border-border bg-raised shadow-card ${className}`} />;
+}
+export function CardTitle({ children, right }: { children: ReactNode; right?: ReactNode }) {
+return <div className="flex items-center justify-between border-b border-border px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{children}{right}</div>;
+}
+export function CardHeader({ title, sub, right }: { title: ReactNode; sub?: ReactNode; right?: ReactNode }) {
+return <div className="flex items-center justify-between border-b border-border px-4 py-3">
+<div><h3 className="text-[13px] font-semibold">{title}</h3>{sub && <p className="mt-0.5 text-xs text-muted-foreground">{sub}</p>}</div>{right}</div>;
+}
+export function PageHeader({ title, desc, actions }: { title: ReactNode; desc?: ReactNode; actions?: ReactNode }) {
+return <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+<div><h1 className="text-lg font-semibold tracking-tight">{title}</h1>{desc && <p className="mt-1 text-[13px] text-muted-foreground">{desc}</p>}</div>
+{actions && <div className="flex items-center gap-2">{actions}</div>}</div>;
+}
+/* ── status ── */
+const TONES = {
+pass: "bg-pass/10 text-pass border-pass/30", fail: "bg-fail/10 text-fail border-fail/30",
+warn: "bg-warn/10 text-warn border-warn/30", info: "bg-info/10 text-info border-info/30",
+draft: "bg-draft/10 text-draft border-draft/30 border-dashed",
+accent: "bg-accent/10 text-accent border-accent/30",
+zinc: "bg-muted text-muted-foreground border-border",
+};
+export type Tone = keyof typeof TONES;
+export function StatusDot({ tone = "zinc", pulse }: { tone?: Tone; pulse?: boolean }) {
+const c = { pass: "bg-pass", fail: "bg-fail", warn: "bg-warn", info: "bg-info", accent: "bg-accent", draft: "bg-draft", zinc: "bg-zinc-400" }[tone];
+return <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${c} ${pulse ? "animate-pulse" : ""}`} />;
+}
+export function Badge({ tone = "zinc", dot, pulse, children }:
+{ tone?: Tone; dot?: boolean; pulse?: boolean; children: ReactNode }) {
+return <span className={`inline-flex items-center gap-1.5 rounded border px-1.5 py-0.5 text-[11px] font-medium tabular-nums ${TONES[tone]}`}>
+{dot && <StatusDot tone={tone} pulse={pulse} />}{children}</span>;
+}
+/* ── data viz ── */
+export function Ring({ pct, size = 112, stroke = 8, label }: { pct: number; size?: number; stroke?: number; label?: string }) {
+const id = useId(); const r = (size - stroke) / 2, c = 2 * Math.PI * r;
+const color = pct >= 80 ? "#10b981" : pct >= 50 ? "#f59e0b" : "#f43f5e";
+return <div className="relative" style={{ width: size, height: size }}>
+<svg width={size} height={size} className="-rotate-90">
+<defs><linearGradient id={id} x1="0" y1="0" x2="1" y2="1">
+<stop offset="0%" stopColor={color} stopOpacity="0.55" /><stop offset="100%" stopColor={color} /></linearGradient></defs>
+<circle cx={size / 2} cy={size / 2} r={r} strokeWidth={stroke} className="stroke-muted" fill="none" />
+<circle cx={size / 2} cy={size / 2} r={r} strokeWidth={stroke} stroke={`url(#${id})`} fill="none"
+strokeLinecap="round" strokeDasharray={c} strokeDashoffset={c * (1 - pct / 100)} /></svg>
+<div className="absolute inset-0 flex flex-col items-center justify-center">
+<span className="text-lg font-semibold tabular-nums">{pct}%</span>
+{label && <span className="text-[10px] text-muted-foreground">{label}</span>}</div></div>;
+}
+export function Meter({ pct, tone = "accent", className = "" }: { pct: number; tone?: Tone; className?: string }) {
+const c = { pass: "bg-pass", fail: "bg-fail", warn: "bg-warn", info: "bg-info", accent: "bg-accent", draft: "bg-draft", zinc: "bg-zinc-400" }[tone];
+return <div className={`h-1.5 overflow-hidden rounded-full bg-muted ${className}`}>
+<div className={`h-full rounded-full ${c} transition-all duration-500`} style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} /></div>;
+}
+export function Sparkline({ points, tone = "accent", w = 88, h = 26 }: { points: number[]; tone?: Tone; w?: number; h?: number }) {
+if (!points?.length) return null;
+const c = { pass: "text-pass", fail: "text-fail", warn: "text-warn", info: "text-info", accent: "text-accent", draft: "text-draft", zinc: "text-zinc-400" }[tone];
+const min = Math.min(...points), max = Math.max(...points);
+const d = points.map((p, i) => `${i ? "L" : "M"}${(i / (points.length - 1)) * w},${h - 2 - ((p - min) / ((max - min) || 1)) * (h - 4)}`).join(" ");
+return <svg width={w} height={h} className={`overflow-visible ${c}`}><path d={d} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>;
+}
+export function Stat({ label, value, delta, deltaTone = "zinc", children }:
+{ label: string; value: ReactNode; delta?: ReactNode; deltaTone?: Tone; children?: ReactNode }) {
+return <Card className="p-4"><p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{label}</p>
+<div className="mt-1.5 flex items-baseline gap-2"><span className="text-2xl font-semibold tabular-nums tracking-tight">{value}</span>
+{delta && <Badge tone={deltaTone}>{delta}</Badge>}</div>{children}</Card>;
+}
+/* ── feedback ── */
+export function Skeleton({ className = "h-4 w-full" }: { className?: string }) {
+return <div className={`animate-pulse rounded bg-muted ${className}`} />;
+}
+export function EmptyState({ icon = "controls", title, desc, action }:
+{ icon?: string; title: string; desc?: string; action?: ReactNode }) {
+return <div className="flex flex-col items-center justify-center px-6 py-12 text-center">
+<div className="mb-3 flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-muted text-muted-foreground"><Icon name={icon} /></div>
+<p className="text-[13px] font-medium">{title}</p>{desc && <p className="mt-1 max-w-xs text-xs text-muted-foreground">{desc}</p>}
+{action && <div className="mt-4">{action}</div>}</div>;
+}
+interface ToastItem { id: number; msg: string; tone: Tone }
+const ToastCtx = createContext<(msg: string, tone?: Tone) => void>(() => {});
+export const useToast = () => useContext(ToastCtx);
+export function ToastProvider({ children }: { children: ReactNode }) {
+const [toasts, setToasts] = useState<ToastItem[]>([]);
+const push = useCallback((msg: string, tone: Tone = "info") => {
+const id = Date.now() + Math.random();
+setToasts((t) => [...t.slice(-3), { id, msg, tone }]);
+setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4200);
+}, []);
+return <ToastCtx.Provider value={push}>{children}
+<div className="pointer-events-none fixed bottom-4 right-4 z-[70] flex w-[340px] flex-col gap-2">
+{toasts.map((t) => <div key={t.id} className="pointer-events-auto flex items-start gap-2.5 rounded-xl border border-border bg-raised px-3.5 py-3 text-[13px] shadow-pop">
+<span className="mt-1"><StatusDot tone={t.tone} /></span><span className="flex-1 leading-snug">{t.msg}</span></div>)}</div>
+</ToastCtx.Provider>;
+}
+/* ── overlays & forms ── */
+export function Tabs<T extends string>({ tabs, active, onChange }:
+{ tabs: { id: T; label: string; count?: number }[]; active: T; onChange: (id: T) => void }) {
+return <div className="flex gap-1 border-b border-border px-2">
+{tabs.map((t) => <button key={t.id} onClick={() => onChange(t.id)}
+className={`-mb-px border-b-2 px-3 py-2 text-[13px] font-medium transition ${active === t.id ? "border-zinc-900 text-zinc-900 dark:border-white dark:text-white" : "border-transparent text-muted-foreground hover:text-zinc-700 dark:hover:text-zinc-200"}`}>
+{t.label}{t.count !== undefined && <span className="ml-1.5 rounded bg-muted px-1 text-[11px] tabular-nums">{t.count}</span>}</button>)}</div>;
+}
+export function Modal({ open, onClose, title, children, width = "max-w-lg" }:
+{ open: boolean; onClose: () => void; title: ReactNode; children: ReactNode; width?: string }) {
+useEffect(() => { if (!open) return; const h = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+window.addEventListener("keydown", h); return () => window.removeEventListener("keydown", h); }, [open, onClose]);
+if (!open) return null;
+return <div className="fixed inset-0 z-50 flex items-start justify-center bg-zinc-950/40 p-4 pt-[10vh] backdrop-blur-[2px] animate-fade-in" onClick={onClose}>
+<div className={`w-full ${width} animate-scale-in rounded-xl border border-border bg-raised shadow-pop`} onClick={(e) => e.stopPropagation()}>
+<div className="flex items-center justify-between border-b border-border px-4 py-3 text-sm font-semibold">{title}
+<IconButton label="Close" onClick={onClose}><Icon name="x" /></IconButton></div>
+<div className="p-4">{children}</div></div></div>;
+}
+export function Kbd({ children }: { children: ReactNode }) {
+return <kbd className="rounded border border-border bg-muted px-1.5 py-0.5 font-sans text-[10px] text-muted-foreground">{children}</kbd>;
+}
+export function Input({ className = "", ...p }: InputHTMLAttributes<HTMLInputElement>) {
+return <input {...p} className={`h-9 w-full rounded-lg border border-border bg-raised px-3 text-[13px] placeholder:text-muted-foreground/60 focus:border-accent/60 focus:outline-none focus:ring-2 focus:ring-accent/15 ${className}`} />;
+}
+export function Select({ className = "", ...p }: SelectHTMLAttributes<HTMLSelectElement>) {
+return <select {...p} className={`h-9 w-full rounded-lg border border-border bg-raised px-3 text-[13px] focus:border-accent/60 focus:outline-none focus:ring-2 focus:ring-accent/15 ${className}`} />;
+}
+export function Textarea({ className = "", ...p }: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+return <textarea {...p} className={`w-full rounded-lg border border-border bg-raised p-3 text-[13px] leading-relaxed focus:border-accent/60 focus:outline-none focus:ring-2 focus:ring-accent/15 ${className}`} />;
+}
+export function Field({ label, children }: { label: string; children: ReactNode }) {
+return <label className="block"><span className="mb-1.5 block text-xs font-medium text-muted-foreground">{label}</span>{children}</label>;
+}
+export function Avatar({ name, className = "h-7 w-7 text-[10px]" }: { name: string; className?: string }) {
+const initials = name.split(" ").map((s) => s[0]).slice(0, 2).join("").toUpperCase();
+return <span className={`inline-flex shrink-0 items-center justify-center rounded-full bg-zinc-900 font-semibold text-white dark:bg-white dark:text-zinc-900 ${className}`}>{initials}</span>;
+}
+```
+### END FILE
+### FILE: apps/web/src/components/CommandPalette.tsx
+```tsx
+"use client";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { Icon, Kbd } from "./ui";
+export interface PaletteItem { id: string; label: string; group: string; icon: string; href?: string; action?: () => void }
+export function CommandPalette({ open, onClose, items }: { open: boolean; onClose: () => void; items: PaletteItem[] }) {
+const router = useRouter(); const [q, setQ] = useState(""); const [idx, setIdx] = useState(0);
+const inputRef = useRef<HTMLInputElement>(null);
+const filtered = useMemo(() => { const s = q.toLowerCase(); return s ? items.filter((i) => i.label.toLowerCase().includes(s)) : items; }, [q, items]);
+useEffect(() => { if (open) { setQ(""); setIdx(0); setTimeout(() => inputRef.current?.focus(), 30); } }, [open]);
+useEffect(() => setIdx(0), [q]);
+if (!open) return null;
+const run = (i: PaletteItem) => { onClose(); if (i.href) router.push(i.href); i.action?.(); };
+return <div className="fixed inset-0 z-[60] flex items-start justify-center bg-zinc-950/40 p-4 pt-[14vh] backdrop-blur-[2px] animate-fade-in" onClick={onClose}>
+<div className="w-full max-w-xl animate-scale-in overflow-hidden rounded-xl border border-border bg-raised shadow-pop" onClick={(e) => e.stopPropagation()}>
+<div className="flex items-center gap-2.5 border-b border-border px-3.5">
+<Icon name="search" className="h-4 w-4 text-muted-foreground" />
+<input ref={inputRef} value={q} onChange={(e) => setQ(e.target.value)}
+onKeyDown={(e) => { if (e.key === "ArrowDown") { e.preventDefault(); setIdx((i) => Math.min(i + 1, filtered.length - 1)); }
+if (e.key === "ArrowUp") { e.preventDefault(); setIdx((i) => Math.max(i - 1, 0)); }
+if (e.key === "Enter" && filtered[idx]) run(filtered[idx]); }}
+placeholder="Search or jump to…" className="h-12 flex-1 bg-transparent text-[13px] outline-none placeholder:text-muted-foreground/60" />
+<Kbd>esc</Kbd></div>
+<div className="max-h-[320px] overflow-y-auto p-1.5">
+{filtered.length === 0 && <p className="px-3 py-6 text-center text-xs text-muted-foreground">No matches for “{q}”.</p>}
+{filtered.map((i, n) => <button key={i.id} onClick={() => run(i)} onMouseEnter={() => setIdx(n)}
+className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13px] ${n === idx ? "bg-muted" : ""}`}>
+<Icon name={i.icon} className="h-4 w-4 text-muted-foreground" /><span className="flex-1">{i.label}</span>
+<span className="text-[10px] uppercase tracking-wide text-muted-foreground/70">{i.group}</span></button>)}
+</div></div></div>;
+}
+```
+### END FILE
+### FILE: apps/web/src/components/AppShell.tsx
+```tsx
+"use client";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { ReactNode, useEffect, useMemo, useState } from "react";
+import { Avatar, Badge, Icon, IconButton, Kbd, ToastProvider } from "./ui";
+import { CommandPalette, PaletteItem } from "./CommandPalette";
+const GROUPS: { label: string; items: { href: string; icon: string; label: string; badge?: number }[] }[] = [
+{ label: "Overview", items: [{ href: "/", icon: "home", label: "Home" }, { href: "/brain", icon: "brain", label: "The Brain" }] },
+{ label: "Compliance", items: [
+{ href: "/controls", icon: "controls", label: "Controls" }, { href: "/evidence", icon: "evidence", label: "Evidence" },
+{ href: "/tests", icon: "tests", label: "Tests" }, { href: "/tasks", icon: "tasks", label: "Tasks", badge: 7 },
+{ href: "/policies", icon: "policies", label: "Policies" }] },
+{ label: "Operations", items: [
+{ href: "/questionnaires", icon: "questionnaire", label: "Questionnaires", badge: 32 },
+{ href: "/vendors", icon: "vendors", label: "Vendors" }, { href: "/privacy", icon: "privacy", label: "Privacy / DSAR" },
+{ href: "/incidents", icon: "incidents", label: "Incidents", badge: 1 }, { href: "/radar", icon: "radar", label: "Reg Radar" }] },
+{ label: "Platform", items: [
+{ href: "/ria", icon: "radar", label: "RIA" }, { href: "/review", icon: "search", label: "Review Console", badge: 4 },
+{ href: "/trust/acme", icon: "trust", label: "Trust Center" }, { href: "/onboarding", icon: "onboard", label: "Onboarding" },
+{ href: "/settings", icon: "controls", label: "Settings" }] },
+];
+function useTheme() {
+const [dark, setDark] = useState(false);
+useEffect(() => { setDark(document.documentElement.classList.contains("dark")); }, []);
+const toggle = () => setDark((d) => { const n = !d; document.documentElement.classList.toggle("dark", n);
+try { localStorage.theme = n ? "dark" : "light"; } catch {} return n; });
+return { dark, toggle };
+}
+export function AppShell({ children }: { children: ReactNode }) {
+const path = usePathname(); const { dark, toggle } = useTheme(); const [palette, setPalette] = useState(false);
+useEffect(() => { const h = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); setPalette((p) => !p); } };
+window.addEventListener("keydown", h); return () => window.removeEventListener("keydown", h); }, []);
+const paletteItems: PaletteItem[] = useMemo(() => [
+...GROUPS.flatMap((g) => g.items.map((i) => ({ id: i.href, label: i.label, group: g.label, icon: i.icon, href: i.href }))),
+{ id: "theme", label: "Toggle dark mode", group: "Actions", icon: dark ? "sun" : "moon", action: toggle },
+], [dark, toggle]);
+return <ToastProvider><div className="flex min-h-screen">
+<aside className="fixed inset-y-0 left-0 z-30 hidden w-[230px] flex-col border-r border-border bg-surface md:flex">
+<div className="flex h-12 items-center gap-2 border-b border-border px-4 font-semibold">
+<span className="flex h-7 w-7 items-center justify-center rounded-lg bg-accent text-white"><Icon name="trust" className="h-3.5 w-3.5" /></span>
+Compliance <Badge tone="zinc">v2</Badge></div>
+<nav className="flex-1 space-y-4 overflow-y-auto p-2.5">
+{GROUPS.map((g) => <div key={g.label}>
+<p className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.09em] text-muted-foreground/80">{g.label}</p>
+{g.items.map((n) => { const active = n.href === "/" ? path === "/" : path.startsWith(n.href);
+return <Link key={n.href} href={n.href}
+className={`flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px] transition ${active ? "bg-muted font-medium text-zinc-900 dark:text-zinc-50" : "text-muted-foreground hover:bg-muted/60 hover:text-zinc-800 dark:hover:text-zinc-100"}`}>
+<Icon name={n.icon} className={`h-4 w-4 ${active ? "text-accent" : "text-muted-foreground/80"}`} />
+<span className="flex-1">{n.label}</span>
+{n.badge !== undefined && <span className="rounded bg-accent px-1.5 text-[10px] font-semibold text-white tabular-nums">{n.badge}</span>}</Link>; })}</div>)}
+</nav>
+<div className="border-t border-border p-2.5">
+<div className="flex items-center gap-2.5 rounded-lg border border-border bg-raised px-2.5 py-2">
+<Avatar name="Sarah Chen" /><div className="min-w-0 flex-1"><p className="truncate text-[13px] font-medium leading-tight">Acme Corp</p>
+<p className="text-[11px] text-muted-foreground">Enterprise trial</p></div>
+<IconButton label="Notifications"><Icon name="bell" className="h-3.5 w-3.5" /></IconButton></div></div>
+</aside>
+<main className="flex-1 md:pl-[230px]">
+<header className="sticky top-0 z-20 flex h-12 items-center gap-3 border-b border-border bg-background/80 px-5 backdrop-blur">
+<button onClick={() => setPalette(true)} className="flex h-8 w-full max-w-[240px] items-center gap-2 rounded-lg border border-border bg-surface px-2.5 text-[12px] text-muted-foreground transition hover:border-border-strong">
+<Icon name="search" className="h-3.5 w-3.5" /><span className="flex-1 text-left">Search…</span><Kbd>⌘K</Kbd></button>
+<div className="flex-1" />
+<IconButton label="Toggle theme" onClick={toggle}><Icon name={dark ? "sun" : "moon"} /></IconButton>
+<Avatar name="Sarah Chen" /></header>
+<div className="mx-auto max-w-[1240px] p-5">{children}</div>
+</main>
+<CommandPalette open={palette} onClose={() => setPalette(false)} items={paletteItems} />
+</div></ToastProvider>;
+}
+```
+### END FILE
+### FILE: apps/web/src/app/page.tsx
+```tsx
+"use client";
+import Link from "next/link";
+import { useApi } from "../lib/useApi";
+import { useBrainStream } from "../lib/useBrainStream";
+import { relTime } from "../lib/format";
+import { Badge, Button, Card, CardTitle, EmptyState, Ring, Skeleton, Stat, StatusDot } from "../components/ui";
+import type { ReadinessResponse } from "../lib/types";
+const FRAMEWORKS = ["SOC2", "ISO27001", "HIPAA", "GDPR"] as const;
+const FW_LABEL: Record<string, string> = { SOC2: "SOC 2", ISO27001: "ISO 27001", HIPAA: "HIPAA", GDPR: "GDPR" };
+const SEV_TONE = { INFO: "zinc", WARN: "warn", ERROR: "fail", CRITICAL: "fail" } as const;
+export default function DashboardPage() {
+const soc2 = useApi<ReadinessResponse>("/v1/readiness/SOC2");
+const iso = useApi<ReadinessResponse>("/v1/readiness/ISO27001");
+const hipaa = useApi<ReadinessResponse>("/v1/readiness/HIPAA");
+const gdpr = useApi<ReadinessResponse>("/v1/readiness/GDPR");
+const readiness = [soc2, iso, hipaa, gdpr];
+const tasks = useApi<{ open: number; overdue: number }>("/v1/tasks?summary=1");
+const quality = useApi<Record<string, number>>("/v1/quality/distribution");
+const { events, connected } = useBrainStream();
+const hour = new Date().getHours();
+const greet = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+const anyData = readiness.some((r) => (r.data?.total ?? 0) > 0);
+const allLoaded = readiness.every((r) => !r.loading);
+if (!anyData && allLoaded) return (
+<Card className="mx-auto max-w-lg p-10 text-center">
+<h1 className="text-lg font-semibold">Welcome to your compliance program</h1>
+<p className="mt-2 text-[13px] text-muted-foreground">Connect your stack and we&apos;ll build one unified control set across SOC 2, ISO 27001, HIPAA and GDPR.</p>
+<Link href="/onboarding" className="mt-4 inline-block"><Button>Start onboarding →</Button></Link></Card>);
+const qTotal = Object.values(quality.data ?? {}).reduce((a, b) => a + b, 0) || 1;
+const qGood = (quality.data?.A ?? 0) + (quality.data?.B ?? 0);
+return <div className="space-y-4">
+<div className="flex items-baseline justify-between">
+<h1 className="text-lg font-semibold tracking-tight">{greet}, Sarah</h1>
+<span className="text-xs text-muted-foreground">{new Date().toDateString()}</span></div>
+<div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+{readiness.map((r, i) => <Card key={FRAMEWORKS[i]} className="flex flex-col items-center gap-3 p-5">
+{r.loading ? <Skeleton className="h-[112px] w-[112px] rounded-full" /> : <Ring pct={r.data?.pct ?? 0} label={FW_LABEL[FRAMEWORKS[i]]} />}
+{r.data && r.data.gaps.length > 0 ? <Badge tone="warn">{r.data.gaps.length} gaps</Badge> : r.data ? <Badge tone="pass">on track</Badge> : null}</Card>)}
+</div>
+<div className="grid gap-4 sm:grid-cols-3">
+<Stat label="Open tasks" value={tasks.data?.open ?? "—"} delta={tasks.data?.overdue ? `${tasks.data.overdue} overdue` : "on track"} deltaTone={tasks.data?.overdue ? "fail" : "pass"} />
+<Stat label="Evidence quality" value={`${Math.round((qGood / qTotal) * 100)}%`} delta={`${qGood}/${qTotal} A–B`} deltaTone={qGood / qTotal > 0.7 ? "pass" : "warn"} />
+<Stat label="Brain" value={connected ? "live" : "off"} delta={connected ? "streaming" : "offline"} deltaTone={connected ? "pass" : "zinc"} />
+</div>
+<div className="grid gap-4 lg:grid-cols-[1fr_360px]">
+<Card><CardTitle right={<Badge tone="pass">avg {qGood / qTotal > 0.8 ? "A" : "B"}</Badge>}>Evidence quality distribution</CardTitle>
+<div className="space-y-2.5 p-4">{(["A", "B", "C", "D", "F"] as const).map((g) => { const n = quality.data?.[g] ?? 0;
+return <div key={g} className="flex items-center gap-2 text-xs"><span className="w-3 font-semibold">{g}</span>
+<div className="h-2 flex-1 rounded-full bg-muted"><div className={`h-2 rounded-full ${g === "A" || g === "B" ? "bg-pass" : g === "F" ? "bg-fail" : "bg-warn"}`} style={{ width: `${(n / qTotal) * 100}%` }} /></div>
+<span className="w-8 text-right tabular-nums text-muted-foreground">{n}</span></div>; })}</div></Card>
+<Card className="flex max-h-[420px] flex-col"><CardTitle right={<span className="flex items-center gap-1.5 text-[10px] normal-case"><StatusDot tone={connected ? "pass" : "zinc"} pulse={connected} /><span className="text-muted-foreground">{connected ? "live" : "offline"}</span></span>}>Live activity</CardTitle>
+<div className="flex-1 divide-y divide-border overflow-y-auto">
+{events.length === 0 && <EmptyState icon="brain" title="Waiting for events" desc="The Brain streams org events here in real time." />}
+{events.map((e) => <div key={e.id} className="flex items-center gap-2.5 px-4 py-2 text-xs">
+<StatusDot tone={SEV_TONE[e.severity]} /><span className="min-w-0 flex-1 truncate font-medium">{e.type}</span>
+<span className="shrink-0 tabular-nums text-muted-foreground">{relTime(e.at)}</span></div>)}</div>
+<Link href="/brain" className="border-t border-border px-4 py-2 text-center text-xs text-muted-foreground hover:text-accent">View the Brain →</Link></Card>
+</div></div>;
+}
+```
+### END FILE

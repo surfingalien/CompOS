@@ -1,0 +1,614 @@
+### FILE: package.json
+```json
+{
+"name": "compliance-platform",
+"private": true,
+"packageManager": "pnpm@9.0.0",
+"workspaces": ["packages/*", "apps/*", "sdks/ts"],
+"scripts": {
+"dev": "turbo run dev",
+"build": "turbo run build",
+"test": "vitest run",
+"db:migrate": "psql \"$DATABASE_URL\" -c 'CREATE EXTENSION IF NOT EXISTS vector' && prisma migrate deploy --schema packages/db/prisma/schema.prisma",
+"db:push": "prisma db push --schema packages/db/prisma/schema.prisma",
+"db:push:brain": "prisma db push --schema packages/brain/prisma/schema.prisma",
+"db:push:ethics": "ETHICS_DATABASE_URL=\"${ETHICS_DATABASE_URL:-postgresql://ethics:ethics@localhost:5433/ethics}\" prisma db push --schema apps/ethics/prisma/schema.prisma",
+"db:vector": "psql \"$DATABASE_URL\" -f packages/db/prisma/vector.sql",
+"db:seed": "tsx packages/db/seed/load-seed.ts",
+"db:seed:templates": "tsx packages/core/src/controls/loadTemplates.ts",
+"db:seed:matrix": "tsx packages/core/src/incidents/loadMatrix.ts",
+"db:seed:sources": "tsx packages/knowledge/src/sources/seed.ts && tsx packages/knowledge/src/legislative/sourcePack.ts",
+"db:seed:prompts": "tsx packages/db/seed/prompts.ts",
+"db:seed:demo": "tsx packages/db/seed/demo.ts",
+"db:rls": "psql \"$DATABASE_URL\" -f packages/db/prisma/rls.sql",
+"audit:rls": "vitest run tests/rls",
+"sdk:generate": "tsx packages/api/src/openapi/generate.ts",
+"load:test": "k6 run tests/load/morningBurst.js"
+},
+"devDependencies": {
+"turbo": "^2.0.0",
+"typescript": "^5.5.0",
+"vitest": "^2.0.0",
+"@types/node": "^22.0.0",
+"pg": "^8.12.0",
+"@types/pg": "^8.11.0"
+}
+}
+```
+### END FILE
+### FILE: packages/db/seed/demo.ts
+```typescript
+/**
+* BATCH 13 — demo seed: every screen renders populated on first boot.
+*
+* pnpm db:seed:demo (after the base seeds; idempotent — safe to re-run)
+*
+* Creates for org "acme" / sarah@acme.test:
+* • Controls: unified bootstrap (all four frameworks) + starter checks
+* • Mock OKTA integration (plaintext-marker creds — seed needs no AWS/KMS)
+* • Hash-chained evidence + TestRuns + quality grades on four controls
+* • Tasks: open / in-progress / DONE-within-verify-window / auto-reopened
+* • Vendors w/ certs (one expiring, one expired) + reviews
+* • Incident with computed statutory notification clocks
+* • Policies (approved + AI draft) · questionnaire w/ drafts · answer library
+* • Privacy: 5 DSARs (one OVERDUE), data map, DPO settings
+* • Trust center (published, slug "acme") + NDA template + signed grant
+* • Reg radar changes · demo API key · Enterprise-trial entitlement
+* • Brain: seeded events/flow/anomaly/health snapshot (best-effort)
+*
+* ALL imports are dynamic so non-AI paths boot without LLM keys.
+*/
+import { randomUUID, randomBytes } from "node:crypto";
+// Placeholders let import-time SDK construction pass; real AI features
+// still need real keys in .env.
+process.env.ANTHROPIC_API_KEY ??= "demo-placeholder";
+process.env.OPENAI_API_KEY ??= "demo-placeholder";
+const DAY = 86_400_000;
+const daysAgo = (n: number) => new Date(Date.now() - n * DAY);
+const daysFromNow = (n: number) => new Date(Date.now() + n * DAY);
+const hoursAgo = (n: number) => new Date(Date.now() - n * 3_600_000);
+async function main() {
+const { prisma } = await import("../src/client");
+const core = await import("@core");
+const { seedStarterChecks } = await import("@skills");
+const { normalizeQuestion } = await import("@questionnaire/retrieval/normalize");
+const { hash: argonHash } = await import("@node-rs/argon2");
+// ── org + user (matches apps/api/src/routes/auth.ts dev-login) ──
+const org = await prisma.organization.upsert({
+where: { slug: "acme" },
+update: { industry: "SAAS", employeeCount: 120, hqCountry: "US" },
+create: { name: "Acme Corp", slug: "acme", industry: "SAAS",
+employeeCount: 120, hqCountry: "US" } });
+const user = await prisma.user.upsert({
+where: { email: "sarah@acme.test" }, update: {},
+create: { email: "sarah@acme.test", name: "Sarah Chen" } });
+const membership = await prisma.membership.upsert({
+where: { userId_orgId: { userId: user.id, orgId: org.id } }, update: {},
+create: { userId: user.id, orgId: org.id, role: "OWNER" } });
+console.log(`✓ org ${org.slug} + owner`);
+// ── controls + starter checks ──────────────────────────────────
+if ((await prisma.control.count({ where: { orgId: org.id } })) === 0) {
+const boot = await core.bootstrapOrgControls(org.id,
+{ frameworkCodes: ["SOC2", "ISO27001", "HIPAA", "GDPR"] });
+console.log(`✓ ${boot.controls} unified controls bootstrapped`);
+}
+const checks = await seedStarterChecks(org.id);
+console.log(`✓ ${checks.created}/${checks.total} starter checks attached`);
+// ── mock integration (no KMS required) ─────────────────────────
+let integration = await prisma.integration.findFirst({
+where: { orgId: org.id, type: "OKTA" } });
+if (!integration) {
+integration = await prisma.integration.create({ data: {
+orgId: org.id, type: "OKTA", status: "CONNECTED",
+config: { demo: true },
+// Demo marker — real connects use storeCredentials() (KMS envelope).
+encryptedCredentials: `mock:${JSON.stringify({
+domain: "demo.okta.example", apiToken: "MOCK" })}`,
+lastSyncAt: hoursAgo(2) } });
+console.log("✓ mock OKTA integration connected");
+}
+// ── test runs + hash-chained evidence + quality grades ─────────
+let failingRunId: string | null = null;
+if ((await prisma.evidence.count({ where: { orgId: org.id } })) === 0) {
+const CHECK_OF: Record<string, string> = {
+"crypto.atRest": "aws-ebs-encryption",
+"access.adminMfa": "okta-admin-mfa",
+"access.offboarding": "offboarding-24h" };
+const mkRun = async (slug: string, status: "PASS" | "FAIL",
+matched: number, total: number, failing: number, ago: number) => {
+const control = await prisma.control.findUniqueOrThrow({
+where: { orgId_slug: { orgId: org.id, slug } } });
+return prisma.testRun.create({ data: {
+orgId: org.id, controlId: control.id,
+testId: `${org.id}:${CHECK_OF[slug]}`, status,
+startedAt: hoursAgo(ago), finishedAt: hoursAgo(ago),
+summary: status === "PASS"
+? `${matched}/${total} items matched`
+: `${failing} item(s) failed predicate`,
+findings: { eval: { matched, total }, failingCount: failing,
+items: status === "PASS"
+? [{ id: "sample-1", ok: true }, { id: "sample-2", ok: true }]
+: [{ email: "j***@example.com", hoursSinceTermination: 31,
+stillActiveInIdp: true },
+{ email: "m***@example.com", hoursSinceTermination: 55,
+stillActiveInIdp: true }] } } });
+};
+const append = async (slug: string, run: { id: string; summary: string | null;
+findings: unknown }, title: string) => {
+const control = await prisma.control.findUniqueOrThrow({
+where: { orgId_slug: { orgId: org.id, slug } } });
+const ev = await core.appendEvidence({
+orgId: org.id, controlId: control.id, sourceType: "AUTOMATED",
+title, description: run.summary ?? undefined,
+expiresAt: daysFromNow(90), payload: run.findings,
+testRunId: run.id, integrationId: integration!.id });
+await core.scoreEvidence(ev.id);
+};
+for (const ago of [6, 3, 1]) // crypto.atRest — PASSING chain
+await append("crypto.atRest", await mkRun("crypto.atRest", "PASS", 203, 203, 0, ago),
+"Encryption status of EBS volumes (AWS)");
+for (const ago of [5, 2]) // access.adminMfa — PASSING chain
+await append("access.adminMfa", await mkRun("access.adminMfa", "PASS", 12, 12, 0, ago),
+"MFA enrollment status for administrative users (Okta)");
+// access.offboarding — PASS then FAIL → FAILING state + task demo
+await append("access.offboarding",
+await mkRun("access.offboarding", "PASS", 0, 0, 0, 4),
+"HRIS ⟕ IdP offboarding reconciliation");
+const rFail = await mkRun("access.offboarding", "FAIL", 0, 2, 2, 1);
+await append("access.offboarding", rFail, "HRIS ⟕ IdP offboarding reconciliation");
+failingRunId = rFail.id;
+const manual = await core.appendManualEvidence(org.id, {
+controlSlug: "vendor.riskProgram", title: "Q3 vendor review minutes",
+notes: "Reviewed Stripe and Datadog; DPAs on file; SOC 2 reports current.",
+uploadedByMembershipId: membership.id });
+await core.scoreEvidence(manual.id);
+console.log("✓ evidence chains (3 automated + 1 manual) + quality grades");
+}
+// ── tasks: every state the Tasks screen shows ──────────────────
+if ((await prisma.task.count({ where: { orgId: org.id } })) === 0) {
+const T = (d: object) => prisma.task.create({ data: { orgId: org.id, ...d } as never });
+await T({ title: "Deprovision terminated employees immediately",
+description: "2 terminated employees retain active IdP access beyond the 24h SLA.",
+status: "OPEN", priority: "CRITICAL", source: "TEST_FAILURE",
+relatedType: "TestRun", relatedId: failingRunId, dueAt: daysFromNow(1) });
+await T({ title: "Verify EU subject facts for GDPR Art.33 clock",
+status: "OPEN", priority: "HIGH", source: "INCIDENT", dueAt: daysFromNow(2) });
+await T({ title: "Evidence quality below gate: vendor.riskProgram",
+description: "Raise vendor-program evidence above the quality gate (70).",
+status: "OPEN", priority: "HIGH", source: "GAP_ANALYSIS", dueAt: daysFromNow(7) });
+await T({ title: "Review Colorado breach-deadline amendment",
+description: "SB 24-10 shortens biometric breach deadline 30d → 21d.",
+status: "OPEN", priority: "MEDIUM", source: "REG_CHANGE", dueAt: daysFromNow(14) });
+await T({ title: "Stripe annual vendor review",
+status: "IN_PROGRESS", priority: "MEDIUM", source: "VENDOR_REVIEW",
+dueAt: daysFromNow(10) });
+await T({ title: "Acknowledge Access Control Policy v1",
+status: "OPEN", priority: "LOW", source: "POLICY_ACK", dueAt: daysFromNow(21) });
+await T({ title: "Fix failing offboarding check",
+description: "Revoke access and re-run offboarding-24h.\n---\n" +
+"AUTO-REOPENED: verification re-test FAIL — fix and mark done again",
+status: "OPEN", priority: "HIGH", source: "TEST_FAILURE",
+relatedType: "TestRun", relatedId: failingRunId });
+await T({ title: "Rotate Okta API token", status: "DONE", priority: "MEDIUM",
+source: "MANUAL", completedAt: hoursAgo(2) }); // within 24h → auto-verifying
+await T({ title: "Upload Q2 access-review evidence", status: "DONE",
+priority: "MEDIUM", source: "GAP_ANALYSIS", completedAt: daysAgo(3) }); // verified
+console.log("✓ 9 tasks (incl. auto-verifying + auto-reopened demos)");
+}
+// ── vendors: certs + reviews drive the two vendor checks ───────
+if ((await prisma.vendor.count({ where: { orgId: org.id } })) === 0) {
+const stripe = await prisma.vendor.create({ data: { orgId: org.id, name: "Stripe",
+criticality: "CRITICAL", dataAccess: "EXTENSIVE", reviewCadenceMonths: 6 } });
+const datadog = await prisma.vendor.create({ data: { orgId: org.id, name: "Datadog",
+criticality: "HIGH", dataAccess: "LIMITED", reviewCadenceMonths: 12 } });
+await prisma.vendor.create({ data: { orgId: org.id, name: "Acme Legal LLP",
+criticality: "LOW", dataAccess: "NONE", reviewCadenceMonths: 24 } });
+await prisma.vendorCertification.create({ data: { vendorId: stripe.id,
+type: "SOC2_TYPE_II", provider: "Stripe", expiresAt: daysFromNow(28) } }); // expiring
+await prisma.vendorCertification.create({ data: { vendorId: datadog.id,
+type: "ISO27001", provider: "Datadog", expiresAt: daysAgo(12) } }); // expired
+await prisma.vendorReview.create({ data: { vendorId: stripe.id, status: "APPROVED",
+soc2ReportProvided: true, dpProvided: true, nextReviewDue: daysFromNow(90) } });
+await prisma.vendorReview.create({ data: { vendorId: datadog.id, status: "UNDER_REVIEW",
+dpProvided: true, nextReviewDue: daysAgo(5) } }); // overdue → cadence check fails
+console.log("✓ 3 vendors + certs + reviews");
+}
+// ── incident + statutory clocks ────────────────────────────────
+if ((await prisma.incident.count({ where: { orgId: org.id } })) === 0) {
+const incident = await prisma.incident.create({ data: {
+orgId: org.id, title: "Suspected credential stuffing on customer portal",
+description: "Elevated failed-login rate from distributed IPs; 3 confirmed account takeovers.",
+severity: "HIGH", status: "TRIAGE", detectedAt: hoursAgo(31),
+affectedDataCategories: ["pii", "credentials"],
+affectedSystems: { "US-CO": 120, "US-FL": 400, "US-TX": 60, "US-NY": 80,
+"EU-DE": 15 } as never,
+isPublicCompany: false } });
+const obligations = await core.computeAndScheduleNotifications(incident.id);
+console.log(`✓ incident + ${obligations.length} statutory notification obligations`);
+}
+// ── policies ───────────────────────────────────────────────────
+if ((await prisma.policy.count({ where: { orgId: org.id } })) === 0) {
+const p1 = await prisma.policy.create({ data: { orgId: org.id,
+title: "Access Control Policy", slug: "access-control" } });
+const v1 = await prisma.policyVersion.create({ data: { policyId: p1.id, version: 1,
+status: "APPROVED", generatedByAI: false, effectiveAt: daysAgo(30),
+approvedAt: daysAgo(30), approvedByMembershipId: membership.id,
+contentMd: `# Access Control Policy
+## Purpose
+Governs provisioning, review, and termination of access [CC6.2] [5.18].
+## Policy Statements
+1. Access is granted only via documented request and approval [CC6.2].
+2. Privileged accounts enforce MFA [CC6.1] [8.5].
+3. Access reviews occur at least quarterly [CC6.3] [5.18].
+4. Terminated personnel lose all access within 24 hours [CC6.2] [5.11].
+## Review Cadence
+Annual.` } });
+await prisma.policy.update({ where: { id: p1.id }, data: { currentVersionId: v1.id } });
+const p2 = await prisma.policy.create({ data: { orgId: org.id,
+title: "Information Security Policy", slug: "information-security" } });
+const v2 = await prisma.policyVersion.create({ data: { policyId: p2.id, version: 1,
+status: "IN_REVIEW", generatedByAI: true,
+contentMd: "# Information Security Policy\n\n_Draft generated by the policy agent — pending human review. AI never auto-publishes._" } });
+await prisma.policy.update({ where: { id: p2.id }, data: { currentVersionId: v2.id } });
+console.log("✓ 2 policies (1 approved, 1 AI draft in review)");
+}
+// ── questionnaire + answer library (review screen) ─────────────
+if ((await prisma.questionnaire.count({ where: { orgId: org.id } })) === 0) {
+const q = await prisma.questionnaire.create({ data: { orgId: org.id,
+customerName: "Northwind Bank — Vendor Security Assessment" } });
+const Q = (question: string, status: string, confidence: number | null,
+answer: string | null, citations: object[] = []) =>
+prisma.questionnaireQuestion.create({ data: { questionnaireId: q.id,
+question, status, confidence, answer, citations: citations as never } });
+await Q("Is MFA required for administrative access?", "AUTO_DRAFTED", 0.96,
+"Yes. All administrative and privileged accounts enforce multi-factor authentication. Enrollment is verified daily against Okta; the last verification passed with 12/12 admins enrolled.",
+[{ type: "policy", id: "access-control", title: "Access Control Policy v1",
+excerpt: "Privileged accounts enforce MFA [CC6.1] [8.5]." }]);
+await Q("How long do you retain audit logs?", "AUTO_DRAFTED", 0.91,
+"Audit logs are retained for 12 months, with 90 days immediately queryable.",
+[{ type: "policy", id: "logging", title: "Logging Policy v2",
+excerpt: "Security logs retained 12 months; 90-day hot window." }]);
+await Q("Do you have a SOC 2 Type II report available?", "AUTO_DRAFTED", 0.89,
+"Our most recent SOC 2 Type II report covers the period ending December 2024 and is available under NDA.", []);
+await Q("Do you perform background checks on employees?", "AI_DRAFTED", 0.78,
+"Background checks are performed prior to hire, consistent with role risk.",
+[{ type: "policy", id: "hr", title: "HR Security Policy",
+excerpt: "Screening consistent with role risk." }]);
+await Q("Where is customer data stored geographically?", "AI_DRAFTED", 0.42, null,
+[{ type: "gap", id: "gap-residency", title: "No data-residency statement found" }]);
+await Q("Do you encrypt data in transit?", "AI_DRAFTED", 0.65,
+"TLS 1.2+ is used for all external traffic.", []);
+await Q("Describe your incident response process and notification timelines.", "STALE", 0.88,
+"Incidents follow a seven-state machine; notification deadlines are computed per jurisdiction.",
+[{ type: "policy", id: "ir", title: "Incident Response Plan v2",
+excerpt: "State machine gates facts before clocks start." }]);
+await Q("Do you subcontract any data processing?", "UNANSWERED", null, null, []);
+for (const [question, answer] of [
+["Is MFA required for administrative access?",
+"Yes. All administrative and privileged accounts enforce multi-factor authentication."],
+["How long do you retain audit logs?",
+"Audit logs are retained for 12 months, with 90 days immediately queryable."],
+["Do you encrypt data at rest?",
+"All production data stores encrypt data at rest (AES-256)."],
+]) {
+await prisma.answerLibrary.create({ data: { orgId: org.id,
+questionNorm: normalizeQuestion(question).normalized,
+canonicalQ: question, answer, citations: [], usageCount: 3,
+lastUsedAt: daysAgo(1), approvedByMembershipId: membership.id } });
+}
+await prisma.retrievalConfig.upsert({ where: { orgId: org.id },
+update: {}, create: { orgId: org.id } });
+console.log("✓ questionnaire (8 questions) + answer library");
+}
+// ── privacy / DSAR inbox ───────────────────────────────────────
+if ((await prisma.privacyRequest.count({ where: { orgId: org.id } })) === 0) {
+const R = async (type: string, email: string, status: string, opts: {
+dueIn: number; verified?: boolean; createdAgo?: number }) => {
+const r = await prisma.privacyRequest.create({ data: {
+orgId: org.id, type: type as never, email, emailHash: core.saltedHash(email),
+status: status as never, dueAt: daysFromNow(opts.dueIn),
+verifiedAt: opts.verified ? daysAgo(1) : null,
+createdAt: daysAgo(opts.createdAgo ?? 1) } });
+await prisma.privacyRequestEvent.create({ data: { requestId: r.id, kind: "CREATED" } });
+if (opts.verified)
+await prisma.privacyRequestEvent.create({ data: { requestId: r.id, kind: "VERIFIED" } });
+};
+await R("ACCESS", "subject1@example.com", "VERIFIED", { dueIn: 12, verified: true });
+await R("ERASE", "subject2@example.com", "VERIFYING", { dueIn: 28 });
+await R("ACCESS", "subject3@example.com", "REVIEW", { dueIn: 3, verified: true, createdAgo: 20 });
+await R("PORT", "subject4@example.com", "DELIVERED", { dueIn: 5, verified: true, createdAgo: 25 });
+await R("ACCESS", "subject5@example.com", "REVIEW", { dueIn: -2, verified: true, createdAgo: 35 }); // OVERDUE
+for (const e of [
+{ systemName: "Okta (identity)", integrationType: "OKTA",
+dataCategories: ["identity"], purposes: ["authentication"],
+subjects: ["employees"], lawfulBasis: "contract", retentionDays: 365 },
+{ systemName: "AWS production", integrationType: "AWS",
+dataCategories: ["pii"], purposes: ["service-delivery"],
+subjects: ["customers"], lawfulBasis: "contract", retentionDays: 730 },
+{ systemName: "Legacy CRM", integrationType: null,
+dataCategories: ["pii"], purposes: ["marketing"],
+subjects: ["customers"], lawfulBasis: "consent", retentionDays: 365 },
+]) {
+await prisma.dataMapEntry.create({
+data: { orgId: org.id, specialCategories: [], ...e } as never });
+}
+await prisma.privacySettings.upsert({ where: { orgId: org.id }, update: {},
+create: { orgId: org.id, dpoName: "Sarah Chen", dpoEmail: "dpo@acme.test",
+noticeUrls: ["https://acme.test/privacy"], extensionPolicy: true,
+dpiaProcessActive: true } });
+console.log("✓ 5 DSARs (1 overdue) + data map + DPO settings");
+}
+// ── trust center (matches the /trust/acme nav link) ────────────
+const tc = await prisma.trustCenter.upsert({
+where: { orgId: org.id }, update: { published: true },
+create: { orgId: org.id, slug: "acme", published: true,
+sections: [
+{ title: "Security program", body: "Unified controls across SOC 2, ISO 27001, HIPAA and GDPR, continuously tested with hash-chained evidence." },
+{ title: "Penetration testing", body: "Annual third-party penetration test; latest report available under NDA." },
+{ title: "Privacy", body: "DSARs handled within Art. 12 timelines; DPO reachable at dpo@acme.test." },
+] as never } });
+if ((await prisma.trustDocument.count({ where: { trustCenterId: tc.id } })) === 0) {
+await prisma.trustDocument.create({ data: { trustCenterId: tc.id,
+name: "Security Overview (public)",
+storageKey: "trust/acme/security-overview.pdf", isPublic: true } });
+await prisma.trustDocument.create({ data: { trustCenterId: tc.id,
+name: "SOC 2 Type II Report (NDA)",
+storageKey: "trust/acme/soc2-type2.pdf", isPublic: false } });
+}
+if (!(await prisma.ndaTemplate.findFirst({ where: { orgId: org.id } }))) {
+await prisma.ndaTemplate.create({ data: { orgId: org.id, name: "Mutual NDA",
+active: true, contentMd: "# Mutual Non-Disclosure Agreement\nThis Mutual NDA is entered into by {{counterparty}} and Acme Corp on {{date}}.\nBoth parties agree to keep confidential information confidential for three (3) years from disclosure.\nSigned: {{signer}}" } });
+}
+if (!(await prisma.trustAccessGrant.findFirst({ where: { trustCenterId: tc.id } }))) {
+await prisma.trustAccessGrant.create({ data: { trustCenterId: tc.id,
+name: "Dana Buyer", email: "dana@northwind.example", company: "Northwind Bank",
+domain: "northwind.example", status: "AUTO_APPROVED", signature: "Dana Buyer",
+signedAt: daysAgo(1), expiresAt: daysFromNow(29) } });
+}
+console.log("✓ trust center (slug acme) + NDA + signed grant");
+// ── reg radar ──────────────────────────────────────────────────
+if ((await prisma.regChange.count()) === 0) {
+const src = (await prisma.regSource.findFirst()) ?? await prisma.regSource.create({
+data: { name: "Federal Register — SEC", url: "https://www.federalregister.gov",
+authority: "SEC", jurisdiction: "US-Federal", category: "Financial",
+checkFrequencyCron: "0 12 * * 1-5", parserType: "FEDERAL_REGISTER_API" } });
+const doc = await prisma.sourceDocument.create({ data: { sourceId: src.id,
+title: "Cybersecurity Risk Management — Final Rule",
+url: "https://www.federalregister.gov/demo", externalRef: "2025-14501",
+contentHash: randomUUID(), rawStorageKey: "raw/demo", docType: "RULE" } });
+const applied = await prisma.regChange.create({ data: { sourceDocumentId: doc.id,
+changeType: "NEW_RULE", jurisdiction: "US-Federal",
+summary: "DFS Part 500 amendment — 72h notification threshold lowered",
+status: "APPLIED", effectiveAt: daysAgo(60), extracted: { confidence: 0.9 } } });
+const req = await prisma.frameworkRequirement.findFirst({
+where: { framework: { code: "SOC2" }, code: "CC7.4" } });
+if (req) await prisma.changeImpact.create({ data: { regChangeId: applied.id,
+frameworkId: "SOC2", requirementId: req.id, impactLevel: "MAJOR",
+rationale: "Tightened notification timelines reach the incident workflow." } });
+await prisma.regChange.create({ data: { sourceDocumentId: doc.id,
+changeType: "GUIDANCE", jurisdiction: "US-CO",
+summary: "Colorado SB 24-10 amends biometric breach deadline 30d → 21d",
+status: "PENDING_REVIEW", extracted: { confidence: 0.8 } } });
+console.log("✓ 2 reg changes (1 applied, 1 pending review)");
+}
+// ── API key (printed ONCE) + entitlement + webhook ─────────────
+if (!(await prisma.apiKey.findFirst({ where: { orgId: org.id } }))) {
+const fullKey = `cpk_live_${randomBytes(24).toString("base64url")}`;
+await prisma.apiKey.create({ data: { orgId: org.id, name: "Demo key",
+prefix: fullKey.slice(0, 16), keyHash: await argonHash(fullKey),
+scopes: ["*"], rateLimitPerMin: 120 } }); // demo convenience — scope down in prod
+console.log(`✓ demo API key (copy now — shown once): ${fullKey}`);
+}
+await prisma.entitlement.upsert({ where: { orgId: org.id }, update: {},
+create: { orgId: org.id, tier: "ENTERPRISE", addons: [], band: "trial",
+modules: { "5": { enabled: true }, "7": { enabled: true, limit: 500 },
+"11": { enabled: true, limit: 100 }, "12": { enabled: true, limit: 50 },
+"13": { enabled: true }, "14": { enabled: true }, "15": { enabled: true } } as never,
+expiresAt: daysFromNow(14) } });
+if (!(await prisma.webhookEndpoint.findFirst({ where: { orgId: org.id } }))) {
+await prisma.webhookEndpoint.create({ data: { orgId: org.id,
+url: "https://example.com/hooks/compliance",
+secret: randomBytes(16).toString("hex"),
+events: ["control.test.failed", "gap.detected", "incident.created"] } });
+}
+// ── brain (best-effort — separate schema) ──────────────────────
+try {
+const { brainDb } = await import("@brain");
+if ((await brainDb.brainEvent.count()) === 0) {
+const evts = [
+["connector.sync.completed", "connector", "INFO"],
+["control.test.passed", "check-runner", "INFO"],
+["control.test.failed", "check-runner", "ERROR"],
+["gap.detected", "check-runner", "WARN"],
+["flow.started", "workers", "INFO"],
+["flow.completed", "workers", "INFO"],
+["llm.generation.completed", "agent", "INFO"],
+["api.request.failed", "api", "WARN"],
+] as const;
+for (let i = 0; i < evts.length; i++) {
+const [type, source, severity] = evts[i];
+await brainDb.brainEvent.create({ data: { id: randomUUID(), type, source,
+orgId: org.id, severity: severity as never, at: hoursAgo(i * 0.4 + 0.2),
+payload: { demo: true } } });
+}
+await brainDb.flowRun.create({ data: { id: randomUUID(), flowType: "CHECK_RUN",
+flowId: `chk-${randomUUID()}`, orgId: org.id, status: "SUCCEEDED",
+startedAt: hoursAgo(2), endedAt: hoursAgo(2), durationMs: 4200,
+eventCount: 3, lastEventAt: hoursAgo(2) } });
+await brainDb.anomaly.create({ data: { detector: "rate", subsystem: "connector",
+metric: "hourly_error_share", orgId: org.id, value: 0.14, baseline: 0.02,
+zScore: 2.6, severity: "WARN", status: "OPEN", details: { seeded: true } } });
+await brainDb.healthSnapshot.create({ data: { composite: 0.96,
+subsystems: { api: 0.99, mcp: 1, connectors: 0.92, check_runner: 0.97,
+llm: 1, temporal: 1, sla_timers: 0.98, review_queue: 0.95,
+ethics_service: 1 }, openAnomalies: 1 } });
+console.log("✓ brain seeded (events, flow, anomaly, health snapshot)");
+}
+await brainDb.$disconnect();
+} catch (e) {
+console.warn(`[demo] brain seed skipped: ${String(e).slice(0, 120)}`);
+}
+await prisma.$disconnect();
+console.log("\n🎉 Demo data ready. Boot with `pnpm dev`, open http://localhost:3000.");
+console.log(" Walk: / (dashboard) → /controls/access.offboarding → /tasks →");
+console.log(" /questionnaires → review → /privacy → /trust/acme → /brain → /onboarding");
+}
+main().catch((e) => { console.error(e); process.exit(1); });
+```
+### END FILE
+### FILE: packages/questionnaire/src/retrieval/embed.ts
+```typescript
+// OVERRIDE (batch 13) — removed module-level `new OpenAI()` (unused here and
+// crashed import when OPENAI_API_KEY was unset). Cohere/on-prem use fetch;
+// the default profile delegates to @agents embedTexts (lazy client).
+import { prisma } from "@db/client";
+import { embedTexts } from "@agents";
+import { normalizeQuestion } from "./normalize";
+export interface EmbeddingProfile {
+id: "default" | "multilingual" | "onprem";
+model: string; dims: number;
+embed(texts: string[]): Promise<number[][]>;
+}
+async function cohereEmbed(texts: string[]): Promise<number[][]> {
+const res = await fetch("https://api.cohere.com/v1/embed", {
+method: "POST",
+headers: { authorization: `Bearer ${process.env.COHERE_API_KEY ?? ""}`,
+"content-type": "application/json" },
+body: JSON.stringify({ model: "embed-multilingual-v3",
+input_type: "search_query", embedding_types: ["float"], texts }),
+});
+if (!res.ok) throw new Error(`Cohere embed ${res.status}`);
+const data = (await res.json()) as { embeddings: { float: number[][] } };
+return data.embeddings.float;
+}
+async function onpremEmbed(texts: string[]): Promise<number[][]> {
+const res = await fetch(process.env.ONPREM_EMBED_URL!, {
+method: "POST", headers: { "content-type": "application/json" },
+body: JSON.stringify({ input: texts }),
+});
+if (!res.ok) throw new Error(`on-prem embed ${res.status}`);
+return ((await res.json()) as { data: { embedding: number[] }[] })
+.map((d) => d.embedding);
+}
+export const PROFILES: Record<string, EmbeddingProfile> = {
+default: { id: "default", model: "text-embedding-3-small", dims: 1536,
+embed: embedTexts },
+multilingual: { id: "multilingual", model: "embed-multilingual-v3", dims: 1024,
+embed: cohereEmbed },
+onprem: { id: "onprem", model: "bge-large-en-v1.5", dims: 1024,
+embed: onpremEmbed },
+};
+const vecLiteral = (v: number[]) => `[${v.join(",")}]`;
+export async function upsertEmbedding(orgId: string, answerId: string,
+vector: number[], model: string): Promise<string> {
+const id = `emb_${answerId}`;
+await prisma.$executeRaw`
+INSERT INTO "AnswerEmbedding" ("id", "orgId", "answerId", "embedding", "model")
+VALUES (${id}, ${orgId}, ${answerId}, ${vecLiteral(vector)}::vector, ${model})
+ON CONFLICT ("answerId") DO UPDATE
+SET "embedding" = EXCLUDED."embedding", "model" = EXCLUDED."model"`;
+return id;
+}
+export async function switchProfile(orgId: string, profileId: keyof typeof PROFILES) {
+const profile = PROFILES[profileId];
+await setRetrievalConfig(orgId, { profile: profileId, reindexing: true });
+const rows = await prisma.answerLibrary.findMany({ where: { orgId } });
+for (const batch of chunk(rows, 256)) {
+const vectors = await profile.embed(
+batch.map((r) => normalizeQuestion(r.canonicalQ).expanded));
+for (let i = 0; i < batch.length; i++) {
+const embeddingId = await upsertEmbedding(orgId, batch[i].id, vectors[i], profile.model);
+await prisma.answerLibrary.update({ where: { id: batch[i].id },
+data: { embeddingId } });
+}
+}
+await setRetrievalConfig(orgId, { profile: profileId, reindexing: false });
+}
+export function chunk<T>(arr: T[], n: number): T[][] {
+const out: T[][] = [];
+for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+return out;
+}
+export async function getRetrievalConfig(orgId: string) {
+return prisma.retrievalConfig.upsert({
+where: { orgId }, update: {}, create: { orgId },
+});
+}
+export async function setRetrievalConfig(orgId: string, patch: Record<string, unknown>) {
+await prisma.retrievalConfig.upsert({
+where: { orgId }, update: patch as any, create: { orgId, ...patch } as any,
+});
+}
+```
+### END FILE
+### FILE: packages/agents/src/embed.ts
+```typescript
+// OVERRIDE (batch 13) — lazy OpenAI client (construction at import crashed
+// every importer without OPENAI_API_KEY).
+import OpenAI from "openai";
+let _openai: OpenAI | null = null;
+function openaiClient(): OpenAI { return (_openai ??= new OpenAI()); }
+export const EMBED_DIMS = 1536;
+export async function embedTexts(texts: string[]): Promise<number[][]> {
+if (texts.length === 0) return [];
+const res = await openaiClient().embeddings.create({
+model: "text-embedding-3-small", input: texts,
+});
+return res.data.map((d) => d.embedding);
+}
+```
+### END FILE
+````
+
+**Surgical patch — `packages/agents/src/runtime.ts`** (too large to re-emit; three 1-minute edits, same fix):
+
+1. Replace the two module-level lines `const anthropic = new Anthropic();` and `const openai = new OpenAI();` with:
+```typescript
+let _anthropic: Anthropic | null = null;
+let _openai: OpenAI | null = null;
+function anthropicClient(): Anthropic { return (_anthropic ??= new Anthropic()); }
+function openaiClient(): OpenAI { return (_openai ??= new OpenAI()); }
+```
+2. In `anthropicComplete`: `await anthropic.messages.create(` → `await anthropicClient().messages.create(`
+3. In `openaiComplete`: `await openai.chat.completions.create(` → `await openaiClient().chat.completions.create(`
+
+---
+
+## Boot with demo data
+
+```bash
+python3 split.py batch13.txt
+docker compose up -d && pnpm install
+pnpm db:push && pnpm db:push:brain && pnpm db:push:ethics
+pnpm db:rls && pnpm db:vector
+pnpm db:seed && pnpm db:seed:templates && pnpm db:seed:matrix
+pnpm db:seed:sources && pnpm db:seed:prompts
+pnpm db:seed:demo        # ← copy the demo API key it prints
+pnpm dev                 # api/web :3000 · brain :3010
+```
+
+Every screen is now populated: dashboard rings/feed · control chains (a PASSING control **and** a FAILING one) · Tasks with ⏳ auto-verifying + auto-reopened rows · questionnaire review with all four groups · privacy inbox with an **OVERDUE** banner · `/trust/acme` with gated docs · incidents with live clocks · brain with health/anomaly history.
+
+---
+
+## "Combine entire code and give me all the files"
+
+Straight with you: **I can't paste ~270 files / ~10,000 lines into one message — and you don't need me to.** That's precisely why the archive-batch mechanism exists: every file already arrived in batches 1–13, and the splitter *is* the combiner. Your complete tree is one command away:
+
+```bash
+cd Compliance
+python3 split.py batch1.txt batch2.txt batch3.txt batch4.txt batch5.txt batch6.txt \
+  batch7.txt batch8.txt batch9.txt batch10.txt batch11.txt batch12.txt batch13.txt
+# verify completeness — expect ~270 files:
+find . -type f -not -path './node_modules/*' -not -path './.git/*' -not -name 'batch*.txt' | wc -l
+find . -type f -name '*.ts' -o -name '*.tsx' -o -name '*.prisma' -o -name '*.sql' \
+  -o -name '*.yaml' -o -name '*.tf' -o -name '*.md' | grep -v node_modules | sort
+# then push:
+git init -b main && git add . && git commit -m "feat: complete AI-first compliance platform (13-batch assembly)"
+git remote add origin https://github.com/BatBond/Compliance.git
+git push -u origin main
+```
+
+Inventory to sanity-check against your tree: `packages/db` ~17 · `core` ~30 · `skills` ~23 · `agents` ~17 · `knowledge` ~15 · `questionnaire` ~14 · `review` ~8 · `mcp` ~9 · `brain` ~16 · `ethics-crypto` ~5 · `apps/api` ~21 · `apps/workers` ~12 · `apps/ethics` ~9 · `apps/web` ~28 · `infra` ~15 · `sdks` ~7 · `tests` ~2 · `docs` ~4 · root ~9.
+
+If any batch file got lost or corrupted on your side, tell me **which one** and I'll re-emit it in full — that's the practical way to recover any missing files.
