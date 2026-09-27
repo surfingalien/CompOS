@@ -1,0 +1,63 @@
+# Production compose for what actually exists in this repo today:
+# Postgres + Redis + the Brain + the API (which mounts /v1/brain/*).
+#
+# The target architecture (docs/architecture.md) also has apps/web,
+# apps/workers (Temporal), and the isolated apps/ethics stack — none of
+# those have code in this repo yet, so they're deliberately left out
+# rather than wired up as placeholders that would fail to build. Add
+# each as its own service here, following the `api`/`brain` pattern,
+# once it has a real Dockerfile-buildable app behind it.
+
+name: compos
+x-restart: &restart { restart: unless-stopped }
+x-build: &build { context: .., dockerfile: docker/Dockerfile.node }
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    <<: *restart
+    environment:
+      POSTGRES_USER: "${PG_USER}"
+      POSTGRES_PASSWORD: "${PG_PASSWORD}"
+      POSTGRES_DB: compos
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U ${PG_USER}"], interval: 10s, retries: 10 }
+
+  redis:
+    image: redis:7-alpine
+    <<: *restart
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 10s, retries: 10 }
+
+  api:
+    build: { <<: *build, args: { SERVICE: apps/api } }
+    <<: *restart
+    env_file: [../.env]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  brain:
+    # THE BRAIN — plain Node process, deliberately outside any workflow
+    # engine so it can detect that engine dying.
+    build: { <<: *build, args: { SERVICE: packages/brain } }
+    <<: *restart
+    env_file: [../.env]
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+
+  ingress:
+    image: caddy:2-alpine
+    <<: *restart
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+    depends_on: [api, brain]
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  caddydata: {}

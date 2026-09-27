@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: brain, namespace: compos }
+spec:
+  replicas: 2 # consumer-group: safe, at-least-once delivery via Redis Streams
+  selector: { matchLabels: { app: brain } }
+  template:
+    metadata: { labels: { app: brain } }
+    spec:
+      containers:
+        - name: brain
+          image: ghcr.io/OWNER/compos/brain:TAG # set by CI before applying
+          envFrom: [{ secretRef: { name: compos-env } }]
+          ports: [{ containerPort: 3010 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 3010 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 3010 }, periodSeconds: 30 }
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits: { cpu: "1", memory: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: brain, namespace: compos }
+spec:
+  selector: { app: brain }
+  ports: [{ port: 3010, targetPort: 3010 }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: brain, namespace: compos }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: brain }
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }

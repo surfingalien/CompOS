@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api, namespace: compos }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: api } }
+  template:
+    metadata: { labels: { app: api } }
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/OWNER/compos/api:TAG # set by CI before applying
+          envFrom: [{ secretRef: { name: compos-env } }]
+          ports: [{ containerPort: 3000 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 3000 } }
+          livenessProbe: { httpGet: { path: /healthz, port: 3000 }, periodSeconds: 30 }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { cpu: "1", memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api, namespace: compos }
+spec:
+  selector: { app: api }
+  ports: [{ port: 3000, targetPort: 3000 }]
