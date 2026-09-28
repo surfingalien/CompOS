@@ -1,0 +1,11 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy==2.0.35
+pydantic==2.9.2
+psycopg2-binary==2.9.9
+python-multipart==0.0.12
+httpx==0.27.2
+# Live AWS evidence connector
+boto3>=1.35,<2
+# Claude for Legal AI / Policy AI / Questionnaire drafting (LLM_PROVIDER=anthropic)
+anthropic>=1.0,<2
