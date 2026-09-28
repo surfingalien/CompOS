@@ -1,0 +1,30 @@
+services:
+  app:
+    build: .
+    container_name: compliance-os
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - compliance_data:/app/data
+      # Optional: mount AWS credentials instead of putting keys in .env
+      # - ~/.aws:/home/compos/.aws:ro
+    restart: unless-stopped
+
+  # Optional Postgres. Enable with:  docker compose --profile postgres up --build
+  # and set DATABASE_URL=postgresql+psycopg2://compos:compos@db:5432/compos in .env
+  db:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: compos
+      POSTGRES_PASSWORD: compos
+      POSTGRES_DB: compos
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  compliance_data:
+  pg_data:
