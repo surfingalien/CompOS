@@ -38,9 +38,12 @@ def sha256_json(data) -> str:
 
 def ensure_sqlite_directory():
     if DATABASE_URL.startswith("sqlite:///"):
-        directory = os.path.dirname(DATABASE_URL.split("sqlite:///", 1)[1])
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+        directory = os.path.dirname(DATABASE_URL.split("sqlite:///", 1)[1]) or "."
+        os.makedirs(directory, exist_ok=True)
+        if not os.access(directory, os.W_OK):
+            raise RuntimeError(
+                f"SQLite directory '{os.path.abspath(directory)}' is not writable by uid {os.getuid()}. "
+                "On Railway set RAILWAY_RUN_UID=0 for volumes, or use Postgres via DATABASE_URL.")
 
 
 class Obj(Base):

@@ -30,6 +30,19 @@ docker compose up --build
 Postgres instead of SQLite: set `DATABASE_URL=postgresql+psycopg2://compos:compos@db:5432/compos` in `.env`
 and run `docker compose --profile postgres up --build`.
 
+## Deploy on Railway
+
+1. Service **Settings → Source**: branch `main`, Root Directory `compliance-os-deploy`.
+   Optionally set **Config-as-code path** to `/compliance-os-deploy/railway.json` (healthcheck `/health`, restart on failure).
+2. **Database** (pick one):
+   - Recommended: **+ New → Database → PostgreSQL**, then add the service variable `DATABASE_URL=${{Postgres.DATABASE_URL}}`.
+   - SQLite: add a Volume mounted at `/app/data` and the variable `RAILWAY_RUN_UID=0`, because Railway volumes are root-owned.
+3. **Variables**: at least `AUTH_ENABLED=true` and a long random `API_KEY`, plus any integrations from `.env.example`.
+4. **Networking**: generate a domain. The container listens on Railway's `$PORT` automatically.
+
+If you see "Application failed to respond", open **Deploy Logs**. The first line reads `CompOS starting: port=… database=…`,
+and any startup error (missing `API_KEY`, unwritable volume, bad `DATABASE_URL`) is printed right after it.
+
 ## Run locally
 
 ```bash
