@@ -40,6 +40,9 @@ async def _scheduler():
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    log.warning("CompOS starting: port=%s database=%s auth=%s search=%s llm=%s",
+                os.getenv("PORT", "8000"), config.DATABASE_URL.split("://")[0], config.AUTH_ENABLED,
+                config.SEARCH_PROVIDER, intel.llm_name())
     if config.AUTH_ENABLED and not config.API_KEY:
         raise RuntimeError("AUTH_ENABLED=true requires API_KEY to be set")
     ensure_sqlite_directory()

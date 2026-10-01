@@ -26,6 +26,9 @@ def _bool(name: str, default: bool = False) -> bool:
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/compliance_os.db")
+# SQLAlchemy 2 rejects the legacy "postgres://" scheme many platforms hand out.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgres://"):]
 SEED_DEMO_DATA = _bool("SEED_DEMO_DATA", True)
 
 # Auth: when enabled every /v1 call needs header X-API-Key: <API_KEY>
